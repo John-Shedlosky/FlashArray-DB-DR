@@ -1,0 +1,98 @@
+###############################################################################
+# Test environment for pg_dr_refresh.py  (matches pg_dr_config.json)
+#   Source array : flasharray1      Replication target : flasharray2
+#   Run each block on the array named in its header. Lines starting with # are comments.
+###############################################################################
+
+# =============================================================================
+# 0. (Optional) Set the Purity array names to match the JSON
+#    Do this BEFORE connecting the arrays.
+# =============================================================================
+# --- on flasharray1 ---
+purearray rename flasharray1
+# --- on flasharray2 ---
+purearray rename flasharray2
+
+
+# =============================================================================
+# 1. flasharray2: get the replication connection key
+# =============================================================================
+purearray list --connection-key
+# -> copy the "Connection Key" value
+
+
+# =============================================================================
+# 2. flasharray1: connect to flasharray2 for async replication
+#    Paste the key from step 1 when prompted.
+#    Replace "flasharray2" with its management FQDN/VIP if the name does not resolve.
+# =============================================================================
+purearray connect --management-address flasharray2 --type async-replication --connection-key
+purearray list --connect
+
+
+# =============================================================================
+# 3. flasharray1: create the volumes
+#    Source volumes (members of PG1/PG2) and DR volumes (members of PG1-DR/PG2-DR).
+#    DR volumes are the same size as their source volumes.
+# =============================================================================
+purevol create --size 100G vol-data-01 vol-data-02 vol-log-01 sql-db sql-log
+purevol create --size 100G vol-data-01-dr vol-data-02-dr vol-log-01-dr sql-db-dr sql-log-dr
+
+
+# =============================================================================
+# 4. flasharray1: create the protection groups
+# =============================================================================
+# Source protection groups (local snapshots only)
+purepgroup create --vollist vol-data-01,vol-data-02,vol-log-01 PG1
+purepgroup create --vollist sql-db,sql-log PG2
+
+# DR protection groups (replicated to flasharray2)
+purepgroup create --vollist vol-data-01-dr,vol-data-02-dr,vol-log-01-dr --targetlist flasharray2 PG1-DR
+purepgroup create --vollist sql-db-dr,sql-log-dr --targetlist flasharray2 PG2-DR
+
+
+# =============================================================================
+# 5. flasharray1: schedules and retention
+#    Local snapshots : every 10 minutes, kept 1 day   (PG1, PG2)
+#    Replication     : every 15 minutes, kept 2 days on flasharray2 (PG1-DR, PG2-DR)
+# =============================================================================
+purepgroup schedule --snap-frequency 10m PG1 PG2
+purepgroup retain --all-for 1d PG1 PG2
+purepgroup enable --snap PG1 PG2
+
+purepgroup schedule --replicate-frequency 15m PG1-DR PG2-DR
+purepgroup retain --all-for 1d --target-all-for 2d PG1-DR PG2-DR
+purepgroup enable --replicate PG1-DR PG2-DR
+
+
+# =============================================================================
+# 6. flasharray1: verify
+# =============================================================================
+purepgroup list PG1 PG2 PG1-DR PG2-DR
+purepgroup list --schedule PG1 PG2 PG1-DR PG2-DR
+purepgroup list --retention PG1 PG2 PG1-DR PG2-DR
+
+
+# =============================================================================
+# 7. flasharray2: verify the target protection groups are present
+#    If either shows as disallowed, allow it.
+# =============================================================================
+purepgroup list flasharray1:PG1-DR flasharray1:PG2-DR
+# purepgroup allow flasharray1:PG1-DR flasharray1:PG2-DR
+
+
+# =============================================================================
+# 8. Script host: confirm the script sees the environment
+# =============================================================================
+# python3 pg_dr_refresh.py -c pg_dr_config.json --dry-run
+# python3 pg_dr_refresh.py -c pg_dr_config.json -V
+
+
+# =============================================================================
+# TEARDOWN (optional) - flasharray1, removes everything created above
+# =============================================================================
+# purepgroup destroy PG1 PG2 PG1-DR PG2-DR
+# purepgroup eradicate PG1 PG2 PG1-DR PG2-DR
+# purevol destroy vol-data-01 vol-data-02 vol-log-01 sql-db sql-log vol-data-01-dr vol-data-02-dr vol-log-01-dr sql-db-dr sql-log-dr
+# purevol eradicate vol-data-01 vol-data-02 vol-log-01 sql-db sql-log vol-data-01-dr vol-data-02-dr vol-log-01-dr sql-db-dr sql-log-dr
+# purearray disconnect flasharray2

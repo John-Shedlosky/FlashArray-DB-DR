@@ -1,0 +1,91 @@
+// ============================================================================
+//  pg_dr_refresh.py configuration
+//  JSON with // comments (the script strips comments before parsing).
+//  Retention is NOT set here: each snapshot follows the retention policy
+//  already configured on its protection group on the array.
+// ============================================================================
+{
+  // ---------------------------------------------------------------- arrays --
+  "source_array": {
+    // Management FQDN, DNS alias, or management VIP/IP the script SSHes to.
+    // The array's Purity name is read automatically with `purearray list`.
+    "host": "flasharray1",
+
+    // Purity user for SSH logins; needs rights to snapshot, copy, and replicate.
+    "ssh_user": "pureuser",
+
+    // Private key used for SSH. Set to null to use your ssh-agent or ~/.ssh defaults.
+    "ssh_key": "~/.ssh/id_rsa_pure"
+  },
+
+  "target_array": {
+    // Purity name of the replication target, exactly as shown by
+    // `purearray connection list` on the source. The script never SSHes to this array.
+    "name": "flasharray2"
+  },
+
+  // ------------------------------------------------------------------ log --
+  // Base log file path. A date code for the Monday of the current week is added
+  // (e.g. pg_dr_refresh_20261102.log), so each week gets a new file.
+  // A relative path is taken relative to the folder this config file is in.
+  // If omitted, defaults to <script folder>/logs/pg_dr_refresh.log.
+  // pure-dr-report.py -c <this file> reads its logs from the same place.
+  "log_file": "/var/log/pure/pg_dr_refresh.log",
+
+  // ------------------------------------------------------------- settings --
+  "settings": {
+    // Start of every snapshot suffix the script creates; the full suffix is
+    // <prefix>-YYYYMMDD-HHMMSS, e.g. PG1.dr-20261103-101500. Letters, digits, dashes only.
+    "snapshot_prefix": "dr",
+
+    // true = wait for each replication to finish so the log records the data replicated
+    //        and replication time (needed for pure-dr-report.py figures).
+    // false = start replication and move on; runs are logged with status "started" and no
+    //         data or time (the -V flag always waits).
+    "wait_for_replication": true,
+
+    // Seconds between replication progress checks while waiting (minimum 1).
+    "poll_interval_seconds": 30,
+
+    // Give up waiting for one replication after this many minutes and mark that pgroup failed (minimum 1).
+    "replication_timeout_minutes": 720,
+
+    // With -V, print one '#' for every N percent replicated (minimum 1). If the array does not
+    // report a Progress column, the -V line shows "running" and the data transferred instead.
+    "hash_every_percent": 3,
+
+    // Maximum seconds any single CLI command may run before it is treated as failed (minimum 10).
+    "ssh_timeout_seconds": 600
+  },
+
+  // ---------------------------------------------------- protection groups --
+  // Processed in order. For each entry: snapshot source_pgroup, overwrite every
+  // "target" volume from its "source" volume in that snapshot, then snapshot
+  // dr_pgroup and replicate it to target_array.
+  "protection_groups": [
+    {
+      // Existing protection group on the source array to snapshot.
+      "source_pgroup": "PG1",
+
+      // Protection group containing the target volumes; snapshotted and replicated.
+      // Must already exist with target_array added (or create it with --setup).
+      "dr_pgroup": "PG1-DR",
+
+      // target = existing volume that gets overwritten (member of dr_pgroup).
+      // source = volume in source_pgroup whose snapshot overwrites it.
+      "volumes": [
+        { "target": "vol-data-01-dr", "source": "vol-data-01" },
+        { "target": "vol-data-02-dr", "source": "vol-data-02" },
+        { "target": "vol-log-01-dr",  "source": "vol-log-01"  }
+      ]
+    },
+    {
+      "source_pgroup": "PG2",
+      "dr_pgroup":     "PG2-DR",
+      "volumes": [
+        { "target": "sql-db-dr",  "source": "sql-db"  },
+        { "target": "sql-log-dr", "source": "sql-log" }
+      ]
+    }
+  ]
+}
