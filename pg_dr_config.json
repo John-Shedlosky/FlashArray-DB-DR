@@ -12,7 +12,7 @@
     "host": "flasharray1",
 
     // Purity user for SSH logins; needs rights to snapshot, copy, and replicate.
-    "ssh_user": "pureuser",
+    "ssh_user": "jjones",
 
     // Private key used for SSH. Set to null to use your ssh-agent or ~/.ssh defaults.
     "ssh_key": "~/.ssh/id_rsa_pure"
