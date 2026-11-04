@@ -48,7 +48,7 @@ Usage
   pg_dr_refresh.py -c pg_dr_config.json            # normal run
   pg_dr_refresh.py -c pg_dr_config.json -V         # verbose: commands, array output, progress bars
   pg_dr_refresh.py -c pg_dr_config.json --dry-run  # log the commands that would run; change nothing
-  pg_dr_refresh.py -c pg_dr_config.json --setup    # one-time: create DR pgroups + add the target
+  pg_dr_refresh.py -c pg_dr_config.json --setup    # one-time: create DR volumes, then DR pgroups + target
 
 Exit code: 0 = every pgroup succeeded, 1 = at least one pgroup failed, 2 = config / usage error.
 
@@ -671,22 +671,147 @@ def write_summary(jobs):
         emit_drdata(j)
 
 
+def _already(e):
+    """True when a CLI error only says the object is already there (safe to ignore during --setup)."""
+    return "already" in str(e).lower()
+
+
+def _msg(e):
+    """CLI error text without a trailing period, so it can be followed by a hint."""
+    return str(e).rstrip(". ")
+
+
 def setup(arr, cfg):
-    """One-time: create DR pgroups and add the replication target.
-    Retention is NOT changed - it is read and logged so you can confirm it before the first run."""
-    target = cfg["target_array"]["name"]
-    for pg in cfg["protection_groups"]:
-        dr_pg, vols = pg["dr_pgroup"], ",".join(v["target"] for v in pg["volumes"])
-        log.info(f"=== setup {dr_pg} ===")
+    """One-time preparation of the source array. For each protection_groups entry, in this order:
+      1. Create every missing DR (target) volume as a copy of its source volume (purevol copy), so it
+         has exactly the same size. The copy is metadata-only on FlashArray and the first refresh
+         overwrites it from the source pgroup snapshot. Existing DR volumes are left as they are.
+      2. Create the DR pgroup with those volumes, or add any missing volumes to an existing DR pgroup.
+         (Volumes must exist first: purepgroup create fails with 'Volume does not exist' otherwise.)
+      3. Add the replication target to the DR pgroup.
+      4. Show the retention of the source and DR pgroups. Retention is never changed.
+    Safe to run again: anything that already exists is reported and left unchanged.
+    The source volumes and source pgroups are never created or changed.
+    Returns the number of protection_groups entries that could not be fully set up."""
+    q = shlex.quote
+    target, pgs = cfg["target_array"]["name"], cfg["protection_groups"]
+    if arr.dry_run:                       # the array is not contacted, so assume nothing exists yet
+        log.info("Dry run: the array is not contacted, so every create command is shown")
+        vols_now, pgs_now = None, set()
+    else:
         try:
-            arr.run(f"purepgroup create --vollist {vols} {shlex.quote(dr_pg)}")
+            out = arr.run("purevol list --csv")
+            vols_now = dict(zip(csv_column(out, "Name"), csv_column(out, "Size")))   # name -> size
+            pgs_now = set(csv_column(arr.run("purepgroup list --csv"), "Name"))
         except CLIError as e:
-            log.warning(f"create failed ({e}); trying to add volumes to existing {dr_pg}")
-            arr.run(f"purepgroup setattr --addvollist {vols} {shlex.quote(dr_pg)}", check=False)
-        arr.run(f"purepgroup setattr --addtargetlist {shlex.quote(target)} {shlex.quote(dr_pg)}", check=False)
-        arr.run(f"purepgroup list --retention {shlex.quote(pg['source_pgroup'])} {shlex.quote(dr_pg)}")
-        log.info(f"Review the retention above. To change it, e.g.: "
-                 f"purepgroup retain --target-all-for 14d {dr_pg}")
+            log.error(f"Setup stopped: could not list the volumes and protection groups ({e})")
+            return len(pgs)
+    exists = lambda name: vols_now is not None and name in vols_now
+    did = lambda done, would: would if arr.dry_run else done          # log wording for --dry-run
+    failed, n_vols, n_pgs = [], 0, 0
+
+    for pg in pgs:
+        src_pg, dr_pg, vols = pg["source_pgroup"], pg["dr_pgroup"], pg["volumes"]
+        log.info(f"=== setup {src_pg} -> {dr_pg} -> {target} ===")
+        problems = []
+        if vols_now is not None and src_pg not in pgs_now:
+            log.warning(f"Source protection group {src_pg} not found. --setup doesn't create it; "
+                        f"create it (or fix source_pgroup) before the first refresh")
+
+        # 1. DR volumes first, each the same size as its source volume.
+        #    Every missing DR volume needs its source volume; if any source is missing, nothing is
+        #    created for this entry, so a typo in the config doesn't leave half a set of DR volumes.
+        missing_src = [v["source"] for v in vols
+                       if vols_now is not None and not exists(v["target"]) and v["source"] not in vols_now]
+        if missing_src:
+            log.error(f"Source volume(s) not found: {', '.join(missing_src)}. Nothing created for {dr_pg}; "
+                      f"fix the 'source' names in the config or create the volumes")
+            failed.append(dr_pg)
+            continue
+        for v in vols:
+            tgt, src = v["target"], v["source"]
+            if exists(tgt):
+                log.info(f"Volume {tgt} already exists ({vols_now[tgt]}), left as is")
+                continue
+            try:
+                arr.run(f"purevol copy {q(src)} {q(tgt)}")
+            except CLIError as e:
+                hint = (". A destroyed volume with this name may be waiting to be eradicated: check "
+                        "'purevol list --pending', then 'purevol recover' or 'purevol eradicate' it"
+                        if _already(e) else "")
+                problems.append(f"can't create {tgt}: {_msg(e)}{hint}")
+                log.error(problems[-1])
+                continue
+            n_vols += 1
+            if vols_now is not None:
+                vols_now[tgt] = vols_now[src]
+                log.info(f"Created volume {tgt} ({vols_now[tgt]}) as a copy of {src}")
+            else:
+                log.info(f"Would create volume {tgt} as a copy of {src}")
+        if problems:
+            log.error(f"{dr_pg} not created or changed, because its volumes aren't all there")
+            failed.append(dr_pg)
+            continue
+
+        # 2. DR protection group with the DR volumes
+        if dr_pg not in pgs_now:
+            try:
+                arr.run(f"purepgroup create --vollist {','.join(q(v['target']) for v in vols)} {q(dr_pg)}")
+            except CLIError as e:
+                hint = (". A destroyed protection group with this name may be waiting to be eradicated: "
+                        "check 'purepgroup list --pending'" if _already(e) else "")
+                log.error(f"can't create protection group {dr_pg}: {_msg(e)}{hint}")
+                failed.append(dr_pg)
+                continue
+            n_pgs += 1
+            pgs_now.add(dr_pg)
+            log.info(f"{did('Created', 'Would create')} protection group {dr_pg} with "
+                     f"{', '.join(v['target'] for v in vols)}")
+        else:
+            log.info(f"Protection group {dr_pg} already exists, adding any missing volumes")
+            for v in vols:
+                try:
+                    arr.run(f"purepgroup setattr --addvollist {q(v['target'])} {q(dr_pg)}")
+                    log.info(f"Added {v['target']} to {dr_pg}")
+                except CLIError as e:
+                    if _already(e):
+                        log.info(f"{v['target']} is already in {dr_pg}")
+                    else:
+                        problems.append(f"can't add {v['target']} to {dr_pg}: {_msg(e)}")
+                        log.error(problems[-1])
+
+        # 3. Replication target
+        try:
+            arr.run(f"purepgroup setattr --addtargetlist {q(target)} {q(dr_pg)}")
+            log.info(f"{did('Added', 'Would add')} replication target {target} to {dr_pg}")
+        except CLIError as e:
+            if _already(e):
+                log.info(f"{target} is already a target of {dr_pg}")
+            else:
+                problems.append(f"can't add target {target} to {dr_pg}: {_msg(e)}. Check that "
+                                f"'purearray connection list' shows {target} (target_array.name)")
+                log.error(problems[-1])
+
+        # 4. Retention (read only)
+        show = [n for n in (src_pg, dr_pg) if vols_now is None or n in pgs_now]
+        try:
+            out = arr.run(f"purepgroup list --retention {' '.join(q(n) for n in show)}")
+            if out:
+                log.info("Retention:\n" + "\n".join("    " + l for l in out.splitlines()))
+                log.info(f"Review the retention above. To change it, e.g.: "
+                         f"purepgroup retain --target-all-for 14d {dr_pg}")
+        except CLIError as e:
+            log.warning(f"Could not read retention ({e})")
+        if problems:
+            failed.append(dr_pg)
+
+    nxt = ("run --setup again without --dry-run to make these changes" if arr.dry_run else
+           "every DR protection group is ready. Next: run with --dry-run, then -V")
+    log.info(f"Setup finished: {did('created', 'would create')} {n_vols} volume(s) and {n_pgs} "
+             f"protection group(s); "
+             + (f"{len(failed)} not ready ({', '.join(failed)}). Fix the errors above and run --setup again"
+                if failed else nxt))
+    return len(failed)
 
 
 def main():
@@ -698,7 +823,8 @@ def main():
                     help="show CLI commands/array output and a replication progress bar")
     ap.add_argument("--dry-run", action="store_true", help="log the commands without running them")
     ap.add_argument("--setup", action="store_true",
-                    help="one-time: create DR pgroups and add the replication target (retention is not changed)")
+                    help="one-time: create the missing DR volumes (as copies of their source volumes), "
+                         "then the DR pgroups, and add the replication target (retention is not changed)")
     args = ap.parse_args()
 
     cfg, s = load_config(args.config)
@@ -719,8 +845,7 @@ def main():
         check_target_connected(arr, target)
 
     if args.setup:
-        setup(arr, cfg)
-        return 0
+        return 1 if setup(arr, cfg) else 0
 
     # Phase 1: start every protection group (snapshot, overwrite, replicate-now) without waiting
     failed, jobs = [], []
