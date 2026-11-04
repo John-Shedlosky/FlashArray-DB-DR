@@ -255,7 +255,7 @@ The refresh script uses non-interactive SSH (BatchMode=yes), so password prompts
 1. Create a key with no passphrase, at the path in source_array.ssh_key:
 
 
-ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa_pure -N ""
+ssh-keygen -t rsa -f ~/.ssh/id_rsa_pure -N ""
 chmod 600 ~/.ssh/id_rsa_pure
 cat ~/.ssh/id_rsa_pure.pub
 
