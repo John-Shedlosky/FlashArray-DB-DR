@@ -1,6 +1,8 @@
 ###############################################################################
 # Test environment for pg_dr_refresh.py  (matches pg_dr_config.json)
-#   Source array : flasharray1      Replication target : flasharray2
+#   Source array : flasharray1  (flasharray1.testdrive.local)
+#   Replication target : flasharray2  (flasharray2.testdrive.local)
+#   flasharray1/flasharray2 are the Purity array names; the FQDNs are the management addresses.
 #   Run each block on the array named in its header. Lines starting with # are comments.
 ###############################################################################
 
@@ -35,12 +37,14 @@ purearray list --connection-key --encrypted
 # 2. flasharray1: connect to flasharray2 for encrypted async replication over IP
 #    Paste the key from step 1 when prompted (Purity//FA 6.6.7+ asks for it; the
 #    --connection-key option is deprecated).
-#    Replace "flasharray2" with its management FQDN/VIP if the name does not resolve.
 #    Older Purity (unencrypted):
-#      purearray connect --management-address flasharray2 --replication-transport ip --type async-replication --connection-key
+#      purearray connect --management-address flasharray2.testdrive.local --replication-transport ip --type async-replication --connection-key
 # =============================================================================
-purearray connect --encrypted --management-address flasharray2 --replication-transport ip --type async-replication
-purearray connection list
+purearray connect --encrypted --management-address flasharray2.testdrive.local --replication-transport ip --type async-replication
+purearray connection list --csv
+# -> the row containing flasharray2.testdrive.local must end in "connected".
+#    "connecting" means the arrays aren't connected yet: wait, then check again. If it stays
+#    "connecting", purearray connection list --path shows the reason (Details column).
 
 
 # =============================================================================

@@ -24,9 +24,10 @@ For every protection group (pgroup) listed in the JSON config, in order:
 Snapshot lifetime follows the retention policy already set on each pgroup on the array
 (--apply-retention), so the script never deletes snapshots itself.
 
-A refresh run contacts only the SOURCE array (over SSH). The replication target is named in the config so
-the script can check it is connected and label the logs. Only --setup also logs in to the TARGET array,
-to read its connection key when the two arrays aren't connected yet.
+A refresh run contacts only the SOURCE array (over SSH). The replication target's host (FQDN) is in the
+config so the script can find its row in `purearray connection list --csv` on the source. The arrays count
+as connected only when that row's last field (Status) is "connected"; "connecting" is not enough. Only
+--setup also logs in to the TARGET array, to read its connection key when the arrays aren't connected yet.
 
 Replication progress
 --------------------
@@ -236,8 +237,11 @@ def load_config(path):
     src, tgt = cfg.get("source_array", {}), cfg.get("target_array", {})
     if not src.get("host"):
         errs.append("source_array.host is required")
-    if not tgt.get("name"):
-        errs.append("target_array.name is required")
+    if not (tgt.get("host") or tgt.get("name")):
+        errs.append("target_array.host is required (the target's management FQDN, e.g. flasharray2.example.com)")
+    ct = tgt.get("connect_timeout_seconds", 300)
+    if isinstance(ct, bool) or not isinstance(ct, (int, float)) or ct < 10:
+        errs.append(f"target_array.connect_timeout_seconds must be a number >= 10 (got {ct!r})")
     if "encrypted" in tgt and not isinstance(tgt["encrypted"], bool):
         errs.append("target_array.encrypted must be true or false")
     if str(tgt.get("replication_transport", "ip")).lower() not in ("ip", "fc"):
@@ -304,36 +308,129 @@ def discover_array_name(arr):
         log.warning(f"Could not determine Purity array name; using host '{arr.host}' in log labels")
 
 
-def connected_arrays(arr):
-    """Arrays connected to `arr` for replication: {Purity name: {column: value}} from
-    purearray connection list --csv (Purity 6.x), or purearray list --connect --csv (older).
+CONNECT_POLL_SECONDS = 5      # how often --setup re-reads the connection list while waiting for "connected"
+
+
+def connection_list(arr):
+    """Rows of the source array's connection list as (header, rows), header in lower case.
+    Uses purearray connection list --csv (Purity 6.x), or purearray list --connect --csv (older).
     Returns None if neither command could be read. Read-only, so it also runs in --dry-run."""
     for cmd in ("purearray connection list --csv", "purearray list --connect --csv"):
         try:
             out = arr.run(cmd, read_only=True)
         except CLIError:
             continue
-        rows = list(csv.reader(io.StringIO(out)))
+        rows = [r for r in csv.reader(io.StringIO(out)) if any(c.strip() for c in r)]
         if not rows:
-            return {}
+            return [], []
         hdr = [h.strip().lower() for h in rows[0]]
         if "name" not in hdr:
             continue
-        return {r[hdr.index("name")].strip(): dict(zip(hdr, (c.strip() for c in r)))
-                for r in rows[1:] if len(r) > hdr.index("name")}
+        return hdr, [[c.strip() for c in r] for r in rows[1:]]
     return None
 
 
-def check_target_connected(arr, target):
-    """Warn (not fail) if the replication target is not in the source array's connected-array list."""
-    conns = connected_arrays(arr)
-    if conns is None:
+def row_status(hdr, row):
+    """Connection status of one row: the LAST field (Purity//FA 6.8.3 and later list Status last).
+    On older releases, where Status isn't the last column, the Status column is used instead."""
+    if "status" in hdr and hdr[-1] != "status" and len(row) == len(hdr):
+        return row[hdr.index("status")].lower()
+    return row[-1].lower() if row else ""
+
+
+def target_keys(tcfg):
+    """What identifies the target in the connection list: its configured name and host (FQDN or IP),
+    plus the host's first DNS label (flasharray2.testdrive.local -> flasharray2), the usual Purity name."""
+    host, name = (tcfg.get("host") or "").strip().lower(), (tcfg.get("name") or "").strip().lower()
+    keys = {k for k in (host, name) if k}
+    if host and not re.match(r"^[0-9.]+$|:", host):
+        keys.add(host.split(".")[0])
+    return keys
+
+
+def target_connection(arr, tcfg):
+    """The source array's replication connection to the target, from purearray connection list --csv:
+    the row that contains the target's host (e.g. flasharray2.testdrive.local in Management Address)
+    or its Purity name, ignoring fleet-management rows. Returns
+      {"name": Purity name, "status": "connected" | "connecting" | ..., "encrypted": bool or None,
+       "type": ..., "line": the row as text}
+    or {} if the target isn't listed, or None if the list couldn't be read."""
+    got = connection_list(arr)
+    if got is None:
+        return None
+    hdr, rows = got
+    keys, ni = target_keys(tcfg), hdr.index("name") if "name" in hdr else 0
+    ti = hdr.index("type") if "type" in hdr else None
+    best = {}
+    for r in rows:
+        if not r or not ({c.lower() for c in r} & keys):
+            continue                                      # this row isn't the target
+        rtype = (r[ti] if ti is not None and len(r) == len(hdr) else "").lower()
+        if "fleet" in rtype:
+            continue                                      # fleet-management, not replication
+        enc = None
+        for col in ("encryption", "encrypted"):
+            if col in hdr and len(r) == len(hdr):
+                v = r[hdr.index(col)].lower()
+                enc = v in ("true", "encrypted", "yes") if v not in ("", "-") else None
+                break
+        hit = {"name": r[ni], "status": row_status(hdr, r), "encrypted": enc, "type": rtype,
+               "line": ",".join(r)}
+        if not best or "async" in rtype:                  # prefer the async-replication row
+            best = hit
+    return best
+
+
+def check_target_connected(arr, tcfg):
+    """Refresh runs: warn (not fail) unless the target's connection status is "connected".
+    Returns the target's Purity name from the connection list (or the configured name/host)."""
+    label = tcfg.get("name") or tcfg.get("host")
+    conn = target_connection(arr, tcfg)
+    if conn is None:
         log.warning("Could not list connected arrays; skipping target check")
-    elif target in conns:
-        log.info(f"Replication target {target} is connected to {arr.name}")
+    elif not conn:
+        log.warning(f"Target {label} not found in 'purearray connection list' on {arr.name} - check "
+                    f"target_array.host/name, or run --setup to connect it")
+    elif conn["status"] != "connected":
+        log.warning(f"Replication target {conn['name']} is listed but its status is '{conn['status']}', "
+                    f"not 'connected'. Replication won't complete until it is connected "
+                    f"(see 'purearray connection list --path' on {arr.name})")
+        return conn["name"]
     else:
-        log.warning(f"Target '{target}' not found in connected arrays {sorted(conns)} - "
-                    f"check target_array.name matches the Purity array name, or run --setup to connect it")
+        log.info(f"Replication target {conn['name']} is connected to {arr.name} (status: connected)")
+        return conn["name"]
+    return label
+
+
+def wait_until_connected(arr, tcfg, timeout):
+    """Re-read purearray connection list --csv until the target's row has status "connected"
+    (its last field), for up to `timeout` seconds. Logs each status change.
+    Returns the connection dict when connected, else None."""
+    deadline, last = time.monotonic() + timeout, None
+    while True:
+        conn = target_connection(arr, tcfg) or {}
+        status = conn.get("status") or "not listed"
+        if status != last:
+            log.info(f"Connection to {conn.get('name') or tcfg.get('host')}: status '{status}'")
+            last = status
+        if status == "connected":
+            return conn
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return None
+        time.sleep(min(CONNECT_POLL_SECONDS, left))
+
+
+def log_connection_paths(arr):
+    """After a failed wait: log 'purearray connection list --path' so the reason is in the log
+    (the Details column shows e.g. 'Connection time-out' on Purity 6.8.3+). Read-only."""
+    try:
+        out = arr.run("purearray connection list --path", read_only=True)
+    except CLIError as e:
+        log.warning(f"Could not read the connection paths ({_msg(e)})")
+        return
+    if out:
+        log.error("purearray connection list --path:\n" + "\n".join("    " + l for l in out.splitlines()))
 
 
 def parse_connection_key(out):
@@ -350,42 +447,64 @@ def parse_connection_key(out):
 
 
 def connect_arrays(arr, tarr, tcfg):
-    """--setup step 1: connect the source array to the target for async replication, unless it already is.
-      1. On the TARGET (over SSH): purearray list --connection-key --encrypted   -> the connection key
-      2. On the SOURCE: purearray connect --encrypted --management-address <target host>
-                          --replication-transport ip --type async-replication
-         The key is typed in at the command's 'connection key' prompt (sent on stdin), so it never
-         appears in a command line, a process list or the log.
+    """--setup step 1: make sure the source array has a "connected" async-replication connection to the
+    target. A connection counts as up only when its row in `purearray connection list --csv` (the row
+    containing the target's host, e.g. flasharray2.testdrive.local) has "connected" as its last field.
+      * listed and "connected"            -> left as is
+      * listed, any other status          -> waits up to connect_timeout_seconds for "connected"
+                                             (it isn't reconnected); fails if it doesn't get there
+      * not listed                        -> connects:
+          1. On the TARGET (over SSH): purearray list --connection-key --encrypted   -> the key
+          2. On the SOURCE: purearray connect --encrypted --management-address <target host>
+                              --replication-transport ip --type async-replication
+             The key is typed in at the command's prompt (sent on stdin), so it never appears in a
+             command line, a process list or the log.
+          3. Waits up to connect_timeout_seconds for the status to change from "connecting" to "connected".
     With "encrypted": false the key comes from purearray list --connection-key, and the connect command
     uses --connection-key instead of --encrypted (Purity before 6.6.7).
-    Returns True if the arrays are connected (or, in --dry-run, would be)."""
-    name, host = tcfg["name"], tcfg.get("host") or tcfg["name"]
+    Returns (connected, name): connected is True when the status is "connected" (or, in --dry-run, would
+    be); name is the target's Purity name used in purepgroup setattr --addtargetlist, if it was read."""
+    host = tcfg.get("host") or tcfg["name"]
     enc = tcfg.get("encrypted", True)
     transport = str(tcfg.get("replication_transport", "ip")).lower()
-    conns = connected_arrays(arr)
-    if conns and name in conns:
-        row = conns[name]
-        status = row.get("status") or "listed"
-        log.info(f"{arr.name} is already connected to {name} (status: {status}), left as is")
-        if enc and str(row.get("encrypted", "")).lower() in ("false", "no", "unencrypted"):
-            log.warning(f"The connection to {name} isn't encrypted. --setup doesn't change an existing "
-                        f"connection; see 'purearray connection enable --encrypted' in the Purity docs")
-        return True
-    if conns is None:
+    timeout = tcfg.get("connect_timeout_seconds", 300)
+    conn = target_connection(arr, tcfg)
+    if conn is None:
         log.warning("Could not list the connected arrays; trying to connect anyway")
+    elif conn:
+        log.info(f"{arr.name} has a connection to {conn['name']} ({host}), status '{conn['status']}'")
+        if enc and conn.get("encrypted") is False:
+            log.warning(f"The connection to {conn['name']} isn't encrypted. --setup doesn't change an existing "
+                        f"connection; see 'purearray connection enable --encrypted' in the Purity docs")
+        if conn["status"] == "connected":
+            log.info(f"{arr.name} is connected to {conn['name']}, left as is")
+            return True, conn["name"]
+        if arr.dry_run:
+            log.warning(f"Status is '{conn['status']}', not 'connected'. The real run waits up to {timeout}s "
+                        f"for 'connected' and stops step 1 if it doesn't get there")
+            return True, conn["name"]
+        log.info(f"Waiting up to {timeout}s for the status to become 'connected' (the connection isn't remade)")
+        up = wait_until_connected(arr, tcfg, timeout)
+        if up:
+            return True, up["name"]
+        log.error(f"The connection to {conn['name']} is still not 'connected' after {timeout}s. Check the "
+                  f"replication network between the arrays (purenetwork list on both, and the Details column below), then "
+                  f"run --setup again")
+        log_connection_paths(arr)
+        return False, conn["name"]
 
-    # 1. log in to the target: check its Purity name, then read its connection key
+    # 1. log in to the target: read its Purity name, then its connection key
     try:
         names = csv_column(tarr.run("purearray list --csv", read_only=True), "Name")
     except CLIError as e:
         log.error(f"Can't log in to the target array {host} as {tarr.user} ({_msg(e)}). Set up SSH key "
                   f"login to the target too (README section 5), or connect the arrays by hand")
-        return False
-    if names and names[0] != name:
-        log.warning(f"{host} reports Purity name '{names[0]}', but target_array.name is '{name}'. The "
-                    f"connection is listed under '{names[0]}', so set target_array.name to that")
-    if arr.dry_run:
-        log.info(f"Logged in to the target {host} as {tarr.user}: OK")
+        return False, tcfg.get("name") or host
+    pname = names[0] if names else (tcfg.get("name") or host.split(".")[0])
+    if tcfg.get("name") and tcfg["name"].lower() not in (pname.lower(), host.lower()):
+        log.warning(f"{host} reports Purity name '{pname}', but target_array.name is '{tcfg['name']}'; "
+                    f"using '{pname}'")
+    log.info(f"Logged in to the target {host} as {tarr.user}: Purity name {pname}")
     key_cmd = "purearray list --connection-key" + (" --encrypted" if enc else "")
     connect_cmd = (f"purearray connect{' --encrypted' if enc else ''} --management-address {shlex.quote(host)} "
                    f"--replication-transport {transport} --type async-replication"
@@ -393,38 +512,42 @@ def connect_arrays(arr, tarr, tcfg):
     if arr.dry_run:
         tarr.run(key_cmd)                                 # logged only: the key isn't read in a dry run
         arr.run(connect_cmd + "   (connection key typed in at the prompt)")
-        log.info(f"Would read the {'encrypted ' if enc else ''}connection key from {name} and connect "
-                 f"{arr.name} to it ({transport}, async-replication{', encrypted' if enc else ''})")
-        return True
+        log.info(f"Would read the {'encrypted ' if enc else ''}connection key from {pname}, connect "
+                 f"{arr.name} to it ({transport}, async-replication{', encrypted' if enc else ''}), then wait "
+                 f"up to {timeout}s for 'purearray connection list --csv' to show it 'connected'")
+        return True, pname
     try:
         key = parse_connection_key(tarr.run(key_cmd, secret=True))
     except CLIError as e:
-        log.error(f"Can't read the connection key from {name}: {_msg(e)}"
+        log.error(f"Can't read the connection key from {pname}: {_msg(e)}"
                   + (". '--encrypted' needs Purity//FA 6.6.7 or later; for older arrays set "
                      "\"encrypted\": false in target_array" if enc else ""))
-        return False
+        return False, pname
     if not key:
-        log.error(f"No connection key found in the output of '{key_cmd}' on {name}")
-        return False
-    log.info(f"Read the {'encrypted ' if enc else ''}connection key from {name} (not logged)")
+        log.error(f"No connection key found in the output of '{key_cmd}' on {pname}")
+        return False, pname
+    log.info(f"Read the {'encrypted ' if enc else ''}connection key from {pname} (not logged)")
 
     # 2. connect from the source, answering the key prompt on stdin
     try:
         arr.run(connect_cmd, stdin=key + "\n")
     except CLIError as e:
-        log.error(f"Connecting {arr.name} to {name} failed: {_msg(e)}. Check the management address "
+        log.error(f"Connecting {arr.name} to {pname} failed: {_msg(e)}. Check the management address "
                   f"({host}) and the replication network ports, then run --setup again")
-        return False
-    for _ in range(6):                                   # the new connection can take a moment to show
-        conns = connected_arrays(arr) or {}
-        if name in conns:
-            log.info(f"Connected {arr.name} to {name} ({transport}, async-replication"
-                     f"{', encrypted' if enc else ''}; status: {conns[name].get('status') or 'listed'})")
-            return True
-        time.sleep(5)
-    log.error(f"'{connect_cmd}' ran, but {name} isn't in the connected arrays list yet. Check "
-              f"'purearray connection list' on {arr.name}")
-    return False
+        return False, pname
+
+    # 3. the new connection shows "connecting" first; wait for "connected"
+    log.info(f"Waiting up to {timeout}s for {pname} to show 'connected' in purearray connection list")
+    up = wait_until_connected(arr, {**tcfg, "name": tcfg.get("name") or pname}, timeout)
+    if up:
+        log.info(f"Connected {arr.name} to {up['name']} ({transport}, async-replication"
+                 f"{', encrypted' if enc else ''}; status: connected)")
+        return True, up["name"]
+    log.error(f"'{connect_cmd}' ran, but {pname} isn't 'connected' after {timeout}s. Check the replication "
+              f"network between the arrays (purenetwork list on both, and the Details column below), then run --setup again; it "
+              f"waits for the existing connection instead of connecting again")
+    log_connection_paths(arr)
+    return False, pname
 
 
 # ----------------------------------------------------------------------------- replication progress
@@ -809,8 +932,9 @@ def _msg(e):
 
 def setup(arr, cfg, tarr=None):
     """One-time build of everything in the config, in this order:
-      1. Array connection - connects the source array to the target for async replication if it isn't
-         already (see connect_arrays: reads the connection key from the target over SSH).
+      1. Array connection - makes sure 'purearray connection list --csv' shows the target as "connected",
+         connecting the arrays first if needed (see connect_arrays: reads the connection key from the
+         target over SSH).
       2. Volumes (on the source array) - all of them before any protection group:
          * a missing source volume is created with its 'size' from the config
            (purevol create --size <size> <source>)
@@ -829,9 +953,9 @@ def setup(arr, cfg, tarr=None):
     Returns the number of protection_groups entries that are not fully set up (all of them if the
     arrays couldn't be connected)."""
     q = shlex.quote
-    target, pgs = cfg["target_array"]["name"], cfg["protection_groups"]
+    tcfg, pgs = cfg["target_array"], cfg["protection_groups"]
     log.info("=== setup step 1 of 4: connect the arrays ===")
-    linked = connect_arrays(arr, tarr, cfg["target_array"])
+    linked, target = connect_arrays(arr, tarr, tcfg)  # connected?, the target's Purity name
     did = lambda done, would: would if arr.dry_run else done            # log wording for --dry-run
     known = True
     try:                                                                # what is on the array now
@@ -950,7 +1074,7 @@ def setup(arr, cfg, tarr=None):
             add_volumes(pg, pgroup, [m for m in members if m in vols_now], new)
             if is_dr and not linked:
                 problem(pg, f"replication target {target} not added to {pgroup}: the arrays aren't "
-                            f"connected (see step 1)")
+                            f"'connected' (see step 1)")
             elif is_dr:
                 try:
                     arr.run(f"purepgroup setattr --addtargetlist {q(target)} {q(pgroup)}")
@@ -1008,7 +1132,8 @@ def main():
     src = cfg["source_array"]
     arr = FlashArray(src["host"], src["host"], src.get("ssh_user") or "pureuser",
                      src.get("ssh_key") or None, s["ssh_timeout_seconds"], args.dry_run)
-    target = cfg["target_array"]["name"]
+    tcfg = cfg["target_array"]
+    target = tcfg.get("name") or tcfg["host"]          # replaced by the Purity name once it is read
     started = datetime.datetime.now()
     suffix = f"{s['snapshot_prefix']}-{started:%Y%m%d-%H%M%S}"     # one suffix for every pgroup in this run
     run_time = started.isoformat(timespec="seconds")               # DRDATA 'time' = run start (report date)
@@ -1019,11 +1144,11 @@ def main():
     if not args.dry_run:
         discover_array_name(arr)
         if not args.setup:                       # --setup checks (and makes) the connection itself
-            check_target_connected(arr, target)
+            target = check_target_connected(arr, tcfg)
 
     if args.setup:
-        tcfg = cfg["target_array"]               # target login: defaults to the source's user and key
-        tarr = FlashArray(tcfg.get("host") or tcfg["name"], tcfg["name"],
+        # target login: defaults to the source's user and key
+        tarr = FlashArray(tcfg.get("host") or tcfg["name"], tcfg.get("host") or tcfg["name"],
                           tcfg.get("ssh_user") or src.get("ssh_user") or "pureuser",
                           tcfg.get("ssh_key", src.get("ssh_key")) or None,
                           s["ssh_timeout_seconds"], args.dry_run)

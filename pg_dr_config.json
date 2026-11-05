@@ -9,7 +9,7 @@
   "source_array": {
     // Management FQDN, DNS alias, or management VIP/IP the script SSHes to.
     // The array's Purity name is read automatically with `purearray list`.
-    "host": "flasharray1",
+    "host": "flasharray1.testdrive.local",
 
     // Purity user for SSH logins; needs rights to snapshot, copy, and replicate.
     "ssh_user": "jjones",
@@ -19,17 +19,19 @@
   },
 
   "target_array": {
-    // Purity name of the replication target, exactly as shown by
-    // `purearray connection list` on the source.
-    "name": "flasharray2",
+    // Management FQDN, DNS alias, or management VIP/IP of the replication target.
+    //  * --setup SSHes here to read the connection key (purearray list --connection-key
+    //    --encrypted) and passes it to purearray connect --management-address <host>.
+    //  * Every run finds the target in `purearray connection list --csv` on the source
+    //    by the row that contains this host (its Management Address). The arrays count
+    //    as connected only when the last field of that row (Status) is "connected";
+    //    "connecting" is not enough.
+    "host": "flasharray2.testdrive.local",
 
-    // The settings below are used only by --setup, to connect the arrays when they
-    // aren't connected yet. A normal refresh run never SSHes to the target.
-    //
-    // Management FQDN, DNS alias, or management VIP/IP of the target. --setup SSHes here
-    // to read the connection key (purearray list --connection-key --encrypted), then runs
-    // purearray connect --management-address <host> on the source. Defaults to "name".
-    "host": "flasharray2",
+    // Optional. Purity array name of the target. If left out, it is read from the
+    // connection list (or from `purearray list` on the target). Purity names can't
+    // contain dots, so this is the short name, e.g. "flasharray2", never the FQDN.
+    // "name": "flasharray2",
 
     // Purity user and private key for SSH logins to the target. If left out, the
     // source_array values are used. The user must be allowed to list the connection key.
@@ -41,7 +43,12 @@
     "encrypted": true,
 
     // Replication network: "ip" (default) or "fc".
-    "replication_transport": "ip"
+    "replication_transport": "ip",
+
+    // --setup: seconds to wait for the connection status to change from "connecting" to
+    // "connected" after purearray connect (or for an existing connection that isn't
+    // "connected" yet). Minimum 10.
+    "connect_timeout_seconds": 300
   },
 
   // ------------------------------------------------------------------ log --
