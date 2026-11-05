@@ -1,6 +1,54 @@
 ﻿Pure DR Refresh and Reporting
 Two Python scripts that refresh DR copies of FlashArray volumes, replicate them to a second array, and report on how much data changes and how long replication takes.
 
+Test Drive Cheat Sheet
+
+sudo dnf install -y python3 python3-pip python3-tkinter openssh-clients git
+
+python3 --version 
+
+sudo mkdir -p /opt/pure-dr /var/log/pure
+
+sudo chown "$USER" /opt/pure-dr /var/log/pure
+
+git clone https://github.com/John-Shedlosky/FlashArray-DB-DR.git /opt/pure-dr
+
+sudo chmod 755 /opt/pure-dr/*.py
+
+ls /opt/pure-dr
+
+ ssh-keygen -t rsa -f ~/.ssh/id_rsa_pure -N ""
+
+ chmod 600 ~/.ssh/id_rsa_pure
+
+ cat ~/.ssh/id_rsa_pure.pub
+
+[copy and paste into flasharray1 and flasharray2]
+ ssh jjones@flasharray1
+
+ pureadmin setattr --publickey
+
+ ssh jjones@flasharray2
+
+ pureadmin setattr --publickey
+
+ssh -i ~/.ssh/id_rsa_pure jjones@flasharray1
+ssh -i ~/.ssh/id_rsa_pure jjones@flasharray2
+
+cd /opt/pure-dr/
+
+python3 pg_dr_refresh.py -c pg_dr_config.json --setup
+
+
+
+
+
+
+
+
+
+
+
 
 File
 	Purpose
