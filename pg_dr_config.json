@@ -20,6 +20,10 @@
 
   "target_array": {
     // Management FQDN, DNS alias, or management VIP/IP of the replication target.
+    //  * Every run SSHes here to monitor replication: the replication status and
+    //    statistics (started, completed, progress, data transferred, physical bytes
+    //    written) are read on the target with
+    //      purepgroup list --snap --transfer --csv <source Purity name>:<dr_pgroup>
     //  * --setup SSHes here to read the connection key (purearray list --connection-key
     //    --encrypted) and passes it to purearray connect --management-address <host>.
     //  * Every run finds the target in `purearray connection list --csv` on the source
@@ -33,9 +37,14 @@
     // contain dots, so this is the short name, e.g. "flasharray2", never the FQDN.
     // "name": "flasharray2",
 
-    // Purity user and private key for SSH logins to the target. If left out, the
-    // source_array values are used. The user must be allowed to list the connection key.
+    // Purity user for SSH logins to the TARGET array (monitoring, and --setup).
+    // Set it separately from source_array.ssh_user; here it is the same user, jjones.
+    // If this line is removed, source_array.ssh_user is used. The user needs to list
+    // protection group snapshots and, for --setup, the connection key.
     "ssh_user": "jjones",
+
+    // Private key for the TARGET array login. Set to null to use your ssh-agent or
+    // ~/.ssh defaults. If this line is removed, source_array.ssh_key is used.
     "ssh_key": "~/.ssh/id_rsa_pure",
 
     // true  = encrypted replication connection (purearray connect --encrypted), Purity//FA 6.6.7+.

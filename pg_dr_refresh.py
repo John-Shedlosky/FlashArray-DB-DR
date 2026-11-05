@@ -14,9 +14,10 @@ For every protection group (pgroup) listed in the JSON config, in order:
     3. Overwrite each existing DR volume from its source snapshot   purevol copy --overwrite
     4. Snapshot the DR pgroup and replicate it now                  purepgroup snap --apply-retention --replicate-now
 
-  Phase 2 - monitor every replication together until each one completes or times out
-    5. purepgroup list --snap --transfer --csv   (pgroup: started / completed / data transferred)
-       purevol list --snap --transfer --csv      (the same per volume)
+  Phase 2 - monitor every replication together, ON THE TARGET ARRAY, until each one completes or times out
+    5. purepgroup list --snap --transfer --csv <source>:<DR pgroup>   (on the target: started / completed /
+                                                  progress / data transferred / physical bytes written)
+       purevol list --snap --transfer --csv      (the same per volume, on the target, if it reports it)
     6. Write a summary of data replicated and replication time per pgroup and per volume,
        plus one machine-readable 'DRDATA {json}' log line per pgroup and per volume.
        pure-dr-report.py reads those DRDATA lines to build its reports.
@@ -24,16 +25,21 @@ For every protection group (pgroup) listed in the JSON config, in order:
 Snapshot lifetime follows the retention policy already set on each pgroup on the array
 (--apply-retention), so the script never deletes snapshots itself.
 
-A refresh run contacts only the SOURCE array (over SSH). The replication target's host (FQDN) is in the
-config so the script can find its row in `purearray connection list --csv` on the source. The arrays count
-as connected only when that row's last field (Status) is "connected"; "connecting" is not enough. Only
---setup also logs in to the TARGET array, to read its connection key when the arrays aren't connected yet.
+Both arrays are reached over SSH. The SOURCE array takes the snapshots, overwrites the DR volumes and
+starts replication. The TARGET array (target_array.host, logged in as target_array.ssh_user) is where the
+replication statistics and status live, so every replication is monitored there. --setup also logs in to
+the target to read its connection key when the arrays aren't connected yet.
+
+The target's host (FQDN) is also used to find its row in `purearray connection list --csv` on the source.
+The arrays count as connected only when that row's last field (Status) is "connected".
 
 Replication progress
 --------------------
-Completion is detected from the 'Completed' column. Some Purity releases do not report a 'Progress'
-column when listing transfers on the replication SOURCE (progress is only known on the target);
-in that case the -V display shows "running" with the data transferred so far instead of a % bar.
+On the target, a replicated pgroup snapshot is named <source Purity name>:<DR pgroup>.<suffix>, for example
+flasharray1:PG1-DR.dr-20261105-020000. The script polls
+    purepgroup list --snap --transfer --csv flasharray1:PG1-DR
+on the target and reads that snapshot's row. Until the snapshot appears on the target the replication is
+shown as "waiting". Completion is detected from the 'Completed' column (or Progress reaching 100%).
 
 Logging
 -------
@@ -128,12 +134,14 @@ def setup_logging(log_base, verbose, dry_run):
 
 # ----------------------------------------------------------------------------- ssh / CLI
 class FlashArray:
-    """The source array, reached with the system 'ssh' client (key-based login, BatchMode)."""
+    """One FlashArray (the source or the replication target), reached with the system 'ssh' client
+    (key-based login, BatchMode)."""
     def __init__(self, host, name, user, key, ssh_timeout, dry_run):
         """host = SSH address; name = label used in logs (replaced by the Purity array name once read);
         user / key = SSH login; ssh_timeout = max seconds per command; dry_run = log commands only."""
         self.host, self.name, self.user, self.key = host, name, user, key
         self.ssh_timeout, self.dry_run = ssh_timeout, dry_run
+        self.purity_name = None              # set once read with purearray list
 
     def run(self, cmd, quiet=False, check=True, read_only=False, stdin=None, secret=False):
         """Run one Purity CLI command over SSH and return its stdout.
@@ -294,18 +302,16 @@ def csv_column(out, column):
     return [r[i].strip() for r in rows[1:] if len(r) > i]
 
 
-def discover_array_name(arr):
-    """Read the source array's Purity name (purearray list) so it does not need to be in the config."""
-    try:
-        names = csv_column(arr.run("purearray list --csv"), "Name")
-    except CLIError as e:
-        names = []
-        log.warning(f"Could not read array name ({e})")
+def discover_array_name(arr, role="Source"):
+    """Read an array's Purity name (purearray list) so it does not need to be in the config.
+    Raises CLIError if the array can't be reached; returns the name, or None if it wasn't listed."""
+    names = csv_column(arr.run("purearray list --csv"), "Name")
     if names:
-        arr.name = names[0]
-        log.info(f"Source array Purity name: {arr.name} (ssh host {arr.host})")
-    else:
-        log.warning(f"Could not determine Purity array name; using host '{arr.host}' in log labels")
+        arr.name = arr.purity_name = names[0]
+        log.info(f"{role} array Purity name: {arr.name} (ssh {arr.user}@{arr.host})")
+        return arr.name
+    log.warning(f"Could not determine the {role.lower()} array's Purity name; using host '{arr.host}' in log labels")
+    return None
 
 
 CONNECT_POLL_SECONDS = 5      # how often --setup re-reads the connection list while waiting for "connected"
@@ -689,7 +695,10 @@ def start_pgroup(arr, pg, target, suffix, run_time, dry_run):
     log.info(f"Created snapshot {dr_snap} and started replication to {target} - continuing")
 
     # Everything monitor_all() / write_summary() need to track this replication
+    # On the target the DR pgroup is listed as <source Purity name>:<DR pgroup>
+    remote_pg = f"{arr.purity_name}:{dr_pg}" if arr.purity_name else None
     return {"pg": src_pg, "dr_pg": dr_pg, "suffix": suffix, "dr_snap": dr_snap, "target": target,
+            "remote_pg": remote_pg, "seen_on_target": False,
             "run_time": run_time, "t0": time.time(), "sizes": sizes,
             "sources": {v["target"]: v["source"] for v in vols},
             "vol_snaps": {f"{dr_snap}.{v['target']}": v["target"] for v in vols},
@@ -698,32 +707,61 @@ def start_pgroup(arr, pg, target, suffix, run_time, dry_run):
             "pg_csv": True, "vol_query": True}
 
 
-def poll_job(arr, job):
-    """One poll of a replication job: pgroup-level row plus per-volume rows. All output -> log file only."""
+def _missing(e):
+    """True when a CLI error says the object doesn't exist (yet), e.g. a snapshot not on the target yet."""
+    t = str(e).lower()
+    return "does not exist" in t or "not exist" in t or "no such" in t or "not found" in t
+
+
+def poll_job(tarr, job):
+    """One poll of a replication job ON THE TARGET ARRAY: the pgroup snapshot's transfer row, then
+    (once that row exists) the per-volume rows. All output goes to the log file only.
+      pgroup:  purepgroup list --snap --transfer --csv <source>:<DR pgroup>
+               -> row <source>:<DR pgroup>.<suffix>
+      volumes: purevol list --snap --transfer --csv <source>:<DR pgroup>.<suffix>.<volume> ...
+    Until the snapshot reaches the target it isn't listed (or the pgroup doesn't exist there yet, on the
+    first replication); that counts as 'waiting', not as an error."""
     q = shlex.quote
     snap = job["dr_snap"]
-    cmd = f"purepgroup list --snap --transfer{' --csv' if job['pg_csv'] else ''} {q(snap)}"
+    arg = f" {q(job['remote_pg'])}" if job["remote_pg"] else ""      # no source name: list every pgroup
+    cmd = f"purepgroup list --snap --transfer{' --csv' if job['pg_csv'] else ''}{arg}"
     try:
-        out = arr.run(cmd, quiet=True)
+        out = tarr.run(cmd, quiet=True)
     except CLIError as e:
+        if _missing(e):
+            if not job.get("noted_missing"):
+                flog.info(f"WAITING {snap}: {job['remote_pg'] or snap} not on {tarr.name} yet ({e})")
+                job["noted_missing"] = True
+            return
         if not job["pg_csv"]:
             raise
-        flog.warning(f"{snap}: --csv not accepted ({e}); using text output")
+        flog.warning(f"{snap}: --csv not accepted on {tarr.name} ({e}); using text output")
         job["pg_csv"] = False
         return
     row = find_row(parse_transfer_table(out), snap)
-    if row:
-        job["row"] = row
+    if not row:                                           # snapshot not on the target yet
+        if not job.get("noted_missing"):
+            flog.info(f"WAITING {snap}: not listed on {tarr.name} yet")
+            job["noted_missing"] = True
+        return
+    job["row"] = row
+    if not job["seen_on_target"]:
+        job["seen_on_target"] = True
+        flog.info(f"ARRIVED {snap}: listed on {tarr.name} (started={row['started'] or '-'})")
     if job["vol_query"]:
-        vcmd = "purevol list --snap --transfer --csv " + " ".join(q(n) for n in job["vol_snaps"])
+        prefix = f"{job['remote_pg'].split(':')[0]}:" if job["remote_pg"] else ""
+        vcmd = "purevol list --snap --transfer --csv " + " ".join(q(prefix + n) for n in job["vol_snaps"])
         try:
-            vtable = parse_transfer_table(arr.run(vcmd, quiet=True))
+            vtable = parse_transfer_table(tarr.run(vcmd, quiet=True))
             for name in job["vol_snaps"]:
                 r = find_row(vtable, name)
                 if r:
                     job["vol_rows"][name] = r
         except CLIError as e:
-            flog.warning(f"{snap}: per-volume transfer listing unavailable ({e}); pgroup-level only")
+            if _missing(e) and not row_done(row):
+                return                                    # volume snapshots not all there yet; try again
+            flog.warning(f"{snap}: per-volume transfer listing unavailable on {tarr.name} ({e}); "
+                         f"pgroup-level only")
             job["vol_query"] = False
 
 
@@ -796,12 +834,13 @@ class ProgressDisplay:
         sys.stdout.flush()
 
 
-def monitor_all(arr, jobs, s, verbose):
-    """Phase 2: poll every in-flight replication in one loop until all complete or time out."""
+def monitor_all(tarr, jobs, s, verbose):
+    """Phase 2: poll every in-flight replication ON THE TARGET ARRAY (tarr) in one loop until all
+    complete or time out."""
     if not jobs:
         return
-    log.info(f"Monitoring {len(jobs)} replication(s) to {jobs[0]['target']} "
-             f"(poll every {s['poll_interval_seconds']}s)")
+    log.info(f"Monitoring {len(jobs)} replication(s) on the target {tarr.host} as {tarr.user} "
+             f"with purepgroup list --snap --transfer --csv (poll every {s['poll_interval_seconds']}s)")
     timeout = s["replication_timeout_minutes"] * 60
     disp = ProgressDisplay(jobs, max(1, int(s["hash_every_percent"]))) if verbose else None
     note = flog if verbose else log          # with -V keep the console for the bars; summary prints after
@@ -812,7 +851,7 @@ def monitor_all(arr, jobs, s, verbose):
             if j["done"]:
                 continue
             try:
-                poll_job(arr, j)
+                poll_job(tarr, j)
             except CLIError as e:
                 j["done"], j["error"] = True, str(e)
                 note.error(f"FAILED monitoring {j['dr_snap']}: {e}")
@@ -822,13 +861,15 @@ def monitor_all(arr, jobs, s, verbose):
                 j["done"], j["elapsed"] = True, time.time() - j["t0"]
                 if j["vol_query"] and not all(row_done(j["vol_rows"].get(n)) for n in j["vol_snaps"]):
                     try:                                            # one last per-volume read
-                        poll_job(arr, j); log_job_progress(j)
+                        poll_job(tarr, j); log_job_progress(j)
                     except CLIError as e:
                         flog.warning(f"{j['dr_snap']}: final per-volume read failed ({e})")
                 note.info(f"Replication complete: {j['dr_snap']} -> {j['target']}  "
                           f"data replicated={(j['row'] or {}).get('transferred') or '-'}")
             elif time.time() - j["t0"] > timeout:
-                last = (f"last progress {j['last_p']:.2f}%" if j["last_p"] is not None else
+                last = (f"it never appeared on {tarr.name} - check that the arrays are connected and the "
+                        f"pgroup is allowed on the target" if not j["seen_on_target"] else
+                        f"last progress {j['last_p']:.2f}%" if j["last_p"] is not None else
                         f"last data transferred {(j['row'] or {}).get('transferred') or '-'}")
                 j["done"], j["error"] = True, f"not complete after {s['replication_timeout_minutes']} min ({last})"
                 note.error(f"FAILED {j['dr_snap']}: {j['error']}")
@@ -1141,17 +1182,31 @@ def main():
     log.info(f"##### pg_dr_refresh start  config={args.config}  source={src['host']}  target={target}  "
              f"{'DRY-RUN ' if args.dry_run else ''}{'SETUP' if args.setup else ''}")
     log.info(f"Log file: {log_path}")
+    # The target array: replication is monitored there; --setup also reads its connection key there.
+    # Login = target_array.ssh_user / ssh_key (each defaults to the source_array value if left out).
+    thost = tcfg.get("host") or tcfg["name"]
+    tarr = FlashArray(thost, thost, tcfg.get("ssh_user") or src.get("ssh_user") or "pureuser",
+                      tcfg.get("ssh_key", src.get("ssh_key")) or None, s["ssh_timeout_seconds"], args.dry_run)
+    log.info(f"Source array: {src['host']} as {arr.user}.  Target array: {thost} as {tarr.user}")
+    monitor = s["wait_for_replication"] or args.verbose
     if not args.dry_run:
-        discover_array_name(arr)
+        try:
+            discover_array_name(arr, "Source")
+        except CLIError as e:
+            log.warning(f"Could not read the source array's name ({e})")
         if not args.setup:                       # --setup checks (and makes) the connection itself
             target = check_target_connected(arr, tcfg)
+        if not args.setup and monitor:           # monitoring needs the target: check the login first
+            try:
+                discover_array_name(tarr, "Target")
+            except CLIError as e:
+                log.error(f"Can't log in to the target array {thost} as {tarr.user} ({_msg(e)}). Replication "
+                          f"is monitored on the target, so nothing was changed. Fix the SSH login "
+                          f"(README section 5, step 4; target_array.ssh_user / ssh_key), or set "
+                          f"wait_for_replication to false to run without monitoring")
+                return 1
 
     if args.setup:
-        # target login: defaults to the source's user and key
-        tarr = FlashArray(tcfg.get("host") or tcfg["name"], tcfg.get("host") or tcfg["name"],
-                          tcfg.get("ssh_user") or src.get("ssh_user") or "pureuser",
-                          tcfg.get("ssh_key", src.get("ssh_key")) or None,
-                          s["ssh_timeout_seconds"], args.dry_run)
         return 1 if setup(arr, cfg, tarr) else 0
 
     # Phase 1: start every protection group (snapshot, overwrite, replicate-now) without waiting
@@ -1167,13 +1222,18 @@ def main():
             if not args.dry_run:
                 emit_failed_start(pg, suffix, run_time, target, str(e))
 
-    # Phase 2: monitor all replications together and log data / time per pgroup and per volume
-    if jobs and (s["wait_for_replication"] or args.verbose):
-        monitor_all(arr, jobs, s, args.verbose)
+    # Phase 2: monitor all replications together ON THE TARGET and log data / time per pgroup and volume
+    if args.dry_run and monitor:
+        src_label = arr.purity_name or "<source Purity name>"
+        for pg in cfg["protection_groups"]:
+            tarr.run(f"purepgroup list --snap --transfer --csv {src_label}:{pg['dr_pgroup']}"
+                     f"   (on the target, until {src_label}:{pg['dr_pgroup']}.{suffix} is complete)")
+    if jobs and monitor:
+        monitor_all(tarr, jobs, s, args.verbose)
         failed += [j["pg"] for j in jobs if j["error"]]
     elif jobs:
-        log.info("wait_for_replication is false - replications left running; check with "
-                 "purepgroup list --snap --transfer")
+        log.info(f"wait_for_replication is false - replications left running; check on the target {thost} "
+                 f"with purepgroup list --snap --transfer {arr.purity_name or '<source>'}:<DR pgroup>")
         for j in jobs:
             emit_started(j)
 

@@ -102,6 +102,12 @@ purepgroup list --retention PG1 PG2 PG1-DR PG2-DR
 purepgroup list flasharray1:PG1-DR flasharray1:PG2-DR
 # purepgroup allow flasharray1:PG1-DR flasharray1:PG2-DR
 
+# Replication status and statistics are on the target. pg_dr_refresh.py monitors with:
+purepgroup list --snap --transfer --csv flasharray1:PG1-DR
+purepgroup list --snap --transfer --csv flasharray1:PG2-DR
+# -> one row per replicated snapshot (flasharray1:PG1-DR.<suffix>) with Started, Completed,
+#    Progress, Data Transferred and Physical Bytes Written.
+
 
 # =============================================================================
 # 8. Script host: confirm the script sees the environment
