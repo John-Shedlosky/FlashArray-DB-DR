@@ -5,15 +5,27 @@ pure-dr-report.py - Visual and text reports of the pg_dr_refresh.py log files.
 What it shows
 -------------
 Reads the weekly pg_dr_refresh_YYYYMMDD.log files and opens a window with these tabs:
-  * Overview         - each protection group and its volumes: size, average change per day, change as
-                       % of size, peak day, last run, average / maximum replication time, OK / failed runs
+  * Overview         - each protection group and its volumes: size, space used on the target, average
+                       change per day, change as % of size, peak day, last run, average / maximum
+                       replication time, OK / failed runs
   * Sizes            - provisioned size of every DR volume, grouped by protection group
   * Daily change     - data replicated per day (stacked by volume) and change rate as % of size
   * Replication time - time per run for each protection group, and per-volume average / maximum
+  * Target space     - space each protection group's snapshots use on the target array, per run, and the
+                       latest value (from purepgroup list --snap --space <pgroup> --total on the target);
+                       the space each new snapshot added, as an estimated growth rate per day and per week
   * Weekly / Monthly - totals per week or month by protection group and volume: data replicated,
                        average per day, average / maximum replication time, OK / failed runs and
                        the change versus the previous week / month; plus the selected period
                        compared with the previous period of the same length
+
+--cli prints the same information in the terminal only: the Overview table plus bar charts drawn with
+'#' (or --bar-char '*') with the numbers beside every bar - DR volume sizes, space used on the target
+per protection group (latest and per day), daily change stacked by
+protection group, change rate as % of size, replication time per day and per volume (average, then
+'*' up to the maximum), this period vs the previous period, and weekly / monthly totals. Each chart
+has its own scale ("1 char = ..."). Periods over 45 days show one row per week in the per-day charts.
+--cli needs no window, display or matplotlib.
 
 Periods
 -------
@@ -37,11 +49,27 @@ How the numbers are calculated
   listed as the last status but not counted as OK or failed.
 * Weekly / Monthly buckets are full calendar weeks (Mon-Sun) or months that overlap the selected
   period; '*' marks a bucket still in progress.
+* Space on target = the (total) row of `purepgroup list --snap --space <source>:<DR pgroup> --total`,
+  read on the target after each monitored run: the space all of that protection group's snapshots use
+  there. It is a point-in-time value, so the report shows the latest measurement in the period (and, per
+  week / month, the last one in that week / month), never a sum. "Change" = latest minus the first
+  measurement in the period. Runs from before pg_dr_refresh.py recorded it show '-'.
+* Space growth on target (estimated) - how fast that space grows:
+    increment = (total) after this run - (total) after the previous successful run of the same pgroup
+                (the space the new snapshot added on the target, net of any older snapshots that
+                expired in the meantime)
+    interval  = time between the two runs' snapshots (run start times)
+    per hour  = increment / interval hours;  est. per day = per hour x 24;  est. per week = per hour x 168
+  So a snapshot that added 250 MiB one hour after the previous one -> 6 GiB/day, 42 GiB/week.
+  "Last" = the latest snapshot in the period; "Avg" = all increments in the period / all their hours
+  (the same x24 / x168), which smooths out single runs. The first measured run of a pgroup has no
+  increment. A negative value means older snapshots expired (retention) and freed more than was added.
 
 Data source
 -----------
 The 'DRDATA {...}' records pg_dr_refresh.py writes after each run (one per protection group and one
-per volume). Older logs without DRDATA records are read from their VOLUME / summary lines (no sizes).
+per volume; the space on the target is in the protection group record, field target_space_bytes).
+Older logs without DRDATA records are read from their VOLUME / summary lines (no sizes).
 
 Usage
 -----
@@ -52,14 +80,16 @@ Usage
   pure-dr-report.py --from 2026-09-01 --to 2026-09-30   # custom date range (inclusive)
   pure-dr-report.py --days 14 --pgroup PG1   # rolling last N days / one protection group
   pure-dr-report.py --as-of 2026-10-31       # report as if today were that date
-  pure-dr-report.py --no-gui                 # text report only (no window)
+  pure-dr-report.py --cli                    # terminal report with '#' bar charts and numbers (no window)
+  pure-dr-report.py --cli --bar-char '*' --width 140   # '*' bars, fixed width (default: terminal width)
+  pure-dr-report.py --no-gui                 # text report only - tables, no charts (no window)
   pure-dr-report.py --no-gui --summary week  # weekly/monthly section: auto | week | month | both | none
   pure-dr-report.py --export-png DIR         # save the charts (incl. weekly + monthly) as PNG files
   pure-dr-report.py --export-csv FILE        # per-run CSV + FILE_period.csv, FILE_weekly.csv, FILE_monthly.csv
 
 Requirements
 ------------
-Python 3.8+. Text and CSV output need nothing else. The window and PNG export need matplotlib 3.5+
+Python 3.8+. --cli, --no-gui and CSV output need nothing else. The window and PNG export need matplotlib 3.5+
 (distro package python3-matplotlib, or pip inside a virtual environment); the window also needs Tk
 (Linux: python3-tk / python3-tkinter / python3.11-tkinter / python311-tk; included with the python.org
 Windows and macOS installers) and a display (desktop session or ssh -X). See README.md for each distro.
@@ -91,6 +121,68 @@ def fmt_bytes(n):
         if abs(n) < 1024 or u == "PiB":
             return f"{n:.0f} {u}" if u == "B" else f"{n:.2f} {u}"
         n /= 1024
+
+def fmt_delta(n):
+    """Signed byte change: 536870912 -> '+512.00 MiB', -1073741824 -> '-1.00 GiB'; None -> '-'."""
+    if n is None:
+        return "-"
+    return ("+" if n >= 0 else "-") + fmt_bytes(abs(n))
+
+def fmt_hours(h):
+    """Hours -> '45 s' / '12 min' (under 1 hour), '1.0 h' (under 72 hours) or '3.5 d'; None -> '-'."""
+    if h is None:
+        return "-"
+    if h < 1 / 60:
+        return f"{h * 3600:.0f} s"
+    if h < 1:
+        return f"{h * 60:.0f} min"
+    return f"{h:.1f} h" if h < 72 else f"{h / 24:.1f} d"
+
+SHORT_INTERVAL_HOURS = 0.25         # increments over less time than this are flagged as unreliable estimates
+
+def fmt_signed(n):
+    """Bytes with a sign for growth figures: '+6.00 GiB', '-512.00 MiB'; None -> '-'."""
+    return "-" if n is None else fmt_delta(n)
+
+def annotate_space_growth(records):
+    """Add the estimated space growth on the target to each pgroup record (in place):
+      target_space_growth_bytes   = target_space_bytes - the previous successful run's target_space_bytes
+                                    (same DR pgroup): the space the new snapshot added on the target
+      target_space_interval_hours = hours between the two runs (run start = snapshot time)
+      target_space_est_hourly_bytes / _daily_bytes / _weekly_bytes = growth / hours x 1, x 24, x 168
+      target_space_prev_snapshots = the previous run's snapshot count (to spot expired snapshots)
+    Only 'ok' runs with a space measurement are used, at both ends; a failed run in between is skipped,
+    so its time is included in the next run's interval and the rate stays correct."""
+    keys = ("target_space_growth_bytes", "target_space_interval_hours", "target_space_est_hourly_bytes",
+            "target_space_est_daily_bytes", "target_space_est_weekly_bytes", "target_space_prev_snapshots")
+    prev = {}
+    for r in sorted((r for r in records if r.get("type") == "pgroup"), key=lambda r: r["time"]):
+        for k in keys:
+            r[k] = None
+        if r.get("status") != "ok" or r.get("target_space_bytes") is None:
+            continue
+        p = prev.get(r["dr_pgroup"])
+        prev[r["dr_pgroup"]] = r
+        if not p:
+            continue
+        hours = (r["time"] - p["time"]).total_seconds() / 3600
+        if hours <= 0:
+            continue
+        inc = r["target_space_bytes"] - p["target_space_bytes"]
+        r.update({"target_space_growth_bytes": inc, "target_space_interval_hours": hours,
+                  "target_space_est_hourly_bytes": inc / hours, "target_space_est_daily_bytes": inc / hours * 24,
+                  "target_space_est_weekly_bytes": inc / hours * 168,
+                  "target_space_prev_snapshots": p.get("target_space_snapshots")})
+
+def growth_rate(recs):
+    """Period growth from annotated pgroup records -> (total increment, total hours, per day, per week,
+    number of increments); per day = total increment / total hours x 24, per week x 168."""
+    g = [r for r in recs if r.get("target_space_growth_bytes") is not None]
+    inc = _sum(r["target_space_growth_bytes"] for r in g)
+    hrs = _sum(r["target_space_interval_hours"] for r in g)
+    if inc is None or not hrs:
+        return inc, hrs, None, None, len(g)
+    return inc, hrs, inc / hrs * 24, inc / hrs * 168, len(g)
 
 def parse_hms(s):
     """'H:MM:SS' -> seconds (legacy log lines); None if unparseable."""
@@ -250,6 +342,24 @@ class Model:
         obj["change_pct"] = (obj["avg_daily"] / obj["size"] * 100) if obj["avg_daily"] and obj["size"] else None
         secs = [r.get("seconds") for r in ok if r.get("seconds") is not None]
         obj["avg_secs"], obj["max_secs"] = mean(secs), (max(secs) if secs else None)
+        # Space on the target (pgroup records only): a point-in-time value per run, so keep the series
+        # and the latest measurement; volumes have none.
+        sp = [r for r in runs if r.get("target_space_bytes") is not None]
+        obj["space_series"] = [(r["time"], r["target_space_bytes"]) for r in sp]
+        obj["space"] = sp[-1]["target_space_bytes"] if sp else None
+        obj["space_snaps"] = sp[-1].get("target_space_snapshots") if sp else None
+        obj["space_time"] = sp[-1]["time"] if sp else None
+        obj["space_first"] = sp[0]["target_space_bytes"] if sp else None
+        obj["space_change"] = (obj["space"] - obj["space_first"]) if len(sp) > 1 else None
+        obj["space_max"] = max(r["target_space_bytes"] for r in sp) if sp else None
+        # Estimated space growth on the target (see annotate_space_growth): latest snapshot + period average
+        gr = [r for r in runs if r.get("target_space_growth_bytes") is not None]
+        obj["growth_series"] = [(r["time"], r["target_space_est_daily_bytes"]) for r in gr]
+        obj["growth_last"] = gr[-1] if gr else None
+        (obj["growth_inc"], obj["growth_hours"], obj["growth_day"], obj["growth_week"],
+         obj["growth_n"]) = growth_rate(gr)
+        obj["target_pgroup"] = next((r.get("target_pgroup") for r in reversed(runs) if r.get("target_pgroup")), None)
+        obj["target"] = next((r.get("target") for r in reversed(runs) if r.get("target")), None)
         last = runs[-1] if runs else None
         obj["last"] = last
         obj["last_status"] = last.get("status") if last else "-"
@@ -377,9 +487,14 @@ def summarize(runs, days):
     ok = [r for r in runs if r.get("status") == "ok"]
     data = _sum(r.get("data_bytes") for r in ok)
     secs = [r["seconds"] for r in ok if r.get("seconds") is not None]
+    sp = [r for r in runs if r.get("target_space_bytes") is not None]      # space on target: latest value
+    last_sp = max(sp, key=lambda r: r["time"]) if sp else {}
     return {"data": data, "per_day": data / days if data is not None and days else None,
             "avg_secs": mean(secs), "max_secs": max(secs) if secs else None, "n_ok": len(ok),
-            "n_fail": sum(1 for r in runs if r.get("status") == "failed"), "days": days}
+            "n_fail": sum(1 for r in runs if r.get("status") == "failed"), "days": days,
+            "space": last_sp.get("target_space_bytes"), "space_snaps": last_sp.get("target_space_snapshots"),
+            "space_time": last_sp.get("time"),
+            **dict(zip(("growth", "growth_hours", "growth_day", "growth_week"), growth_rate(runs)[:4]))}
 
 def summaries(records, days, pg_filter=None):
     """(pgroup, volume|None) -> summary dict, protection group rows first, then their volumes."""
@@ -405,7 +520,9 @@ def compare(cur, prev, days):
         rows.append({"pg": k[0], "volume": k[1], "label": c["label"], "dr_pgroup": c["dr_pgroup"], "cur": c,
                      "prev": p, "chg": {"data": pct(c["data"], p and p["data"]),
                                         "per_day": pct(c["per_day"], p and p["per_day"]),
-                                        "avg_secs": pct(c["avg_secs"], p and p["avg_secs"])}})
+                                        "avg_secs": pct(c["avg_secs"], p and p["avg_secs"]),
+                                        "space": pct(c["space"], p and p.get("space")),
+                                        "growth_day": pct(c.get("growth_day"), p and p.get("growth_day"))}})
     return rows
 
 class Report:
@@ -415,6 +532,7 @@ class Report:
         Records dated after 'today' are ignored, so --as-of reproduces a report from that date."""
         self.today = today or datetime.date.today()
         self.records = sorted((r for r in records if r["time"].date() <= self.today), key=lambda r: r["time"])
+        annotate_space_growth(self.records)      # over every record, so a period's first run has its baseline
         self.first = self.records[0]["time"].date() if self.records else None
         self.last = self.records[-1]["time"].date() if self.records else None
         self.all_model = Model(self.records)
@@ -431,14 +549,20 @@ class Report:
         return [r for r in self.records if (s is None or r["time"].date() >= s)
                 and (e is None or r["time"].date() <= e)]
 
-    def days(self, s, e):
-        """Calendar days of s..e from the first log up to today (days with no runs count as 0).
-        Today only counts once it has a run, so a report before the nightly run is not diluted."""
+    def date_range(self, s, e):
+        """(first, last) calendar date of s..e that the logs cover: from the first log up to today,
+        where today only counts once it has a run (a report before the nightly run is not diluted).
+        (None, None) if nothing in s..e is covered."""
         if not self.first:
-            return 0
+            return None, None
         data_end = self.today if self.last >= self.today else self.today - D(days=1)
         lo, hi = max(s or self.first, self.first), min(e or data_end, data_end)
-        return max(0, (hi - lo).days + 1)
+        return (lo, hi) if lo <= hi else (None, None)
+
+    def days(self, s, e):
+        """Calendar days of s..e covered by the logs (see date_range); days with no runs count as 0."""
+        lo, hi = self.date_range(s, e)
+        return (hi - lo).days + 1 if lo else 0
 
     def model_for(self, period):
         """Model of the records in the period, with averages per calendar day of the period."""
@@ -507,21 +631,80 @@ CMP_HEADS = ("Data replicated", "Avg / day", "Avg time", "Max time", "OK/Fail", 
 # ============================================================================ text / csv output
 def overview_lines(model, pg_filter=None):
     """Text Overview table: one line per protection group and per volume for the period's Model."""
-    hdr = f"{'Protection group / volume':<34}{'Size':>12}{'Avg/day':>13}{'%/day':>8}{'Last data':>13}" \
-          f"{'Last time':>11}{'Avg time':>10}{'Max time':>10}{'OK/Fail':>9}  Status"
+    hdr = f"{'Protection group / volume':<34}{'Size':>12}{'Tgt space':>13}{'Tgt est/day':>13}{'Tgt est/wk':>13}" \
+          f"{'Avg/day':>13}{'%/day':>8}{'Last data':>13}{'Last time':>11}{'Avg time':>10}{'Max time':>10}" \
+          f"{'OK/Fail':>9}  Status"
     out = [hdr, "-" * len(hdr)]
     for pg in model.selected(pg_filter):
         def row(label, o):
             """One formatted Overview line."""
             last = o["last"] or {}
             pct_ = f"{o['change_pct']:.2f}" if o["change_pct"] is not None else "-"
-            return (f"{label[:33]:<34}{fmt_bytes(o['size']):>12}{fmt_bytes(o['avg_daily']):>13}{pct_:>8}"
+            is_pg = "volumes" in o                                              # space: per pgroup only
+            gl = (o["growth_last"] or {}) if is_pg else {}
+            space = fmt_bytes(o["space"]) if is_pg else ""
+            gday = fmt_signed(gl.get("target_space_est_daily_bytes")) if is_pg else ""
+            gweek = fmt_signed(gl.get("target_space_est_weekly_bytes")) if is_pg else ""
+            return (f"{label[:33]:<34}{fmt_bytes(o['size']):>12}{space:>13}{gday:>13}{gweek:>13}"
+                    f"{fmt_bytes(o['avg_daily']):>13}{pct_:>8}"
                     f"{fmt_bytes(last.get('data_bytes')):>13}{fmt_secs(last.get('seconds')):>11}"
                     f"{fmt_secs(o['avg_secs']):>10}{fmt_secs(o['max_secs']):>10}"
                     f"{str(o['n_ok']) + '/' + str(o['n_fail']):>9}  {o['last_status']}")
         out.append(row(f"{pg['name']} -> {pg['dr_pgroup']}", pg))
         for v in pg["volumes"].values():
             out.append(row(f"  {v['name']}", v))
+    if len(out) == 2:
+        out.append("(no runs in this period)")
+    return out
+
+def space_lines(model, pg_filter=None):
+    """Text table of the space each protection group uses on the target: the latest (total) of
+    purepgroup list --snap --space <pgroup> --total in the period, its bytes, snapshot count and time,
+    plus the first measurement in the period, the change and the maximum."""
+    hdr = (f"{'Protection group':<26}{'On target':<34}{'Latest':>12}{'Bytes':>17}{'Snaps':>7}  "
+           f"{'Measured':<17}{'Period start':>13}{'Change':>13}{'Max':>12}")
+    out = [hdr, "-" * len(hdr)]
+    for pg in model.selected(pg_filter):
+        where = (pg["target_pgroup"] or pg["dr_pgroup"]) + (f" on {pg['target']}" if pg["target"] else "")
+        if pg["space"] is None:
+            out.append(f"{(pg['name'] + ' -> ' + pg['dr_pgroup'])[:25]:<26}{where[:33]:<34}{'-':>12}"
+                       f"   (not recorded in this period)")
+            continue
+        snaps = "-" if pg["space_snaps"] is None else str(pg["space_snaps"])
+        out.append(f"{(pg['name'] + ' -> ' + pg['dr_pgroup'])[:25]:<26}{where[:33]:<34}{fmt_bytes(pg['space']):>12}"
+                   f"{pg['space']:>17,.0f}{snaps:>7}  {pg['space_time']:%Y-%m-%d %H:%M}"
+                   f"{fmt_bytes(pg['space_first']):>13}{fmt_delta(pg['space_change']):>13}{fmt_bytes(pg['space_max']):>12}")
+    if len(out) == 2:
+        out.append("(no runs in this period)")
+    return out
+
+def growth_lines(model, pg_filter=None):
+    """Text table of the estimated space growth on the target per protection group: the latest snapshot's
+    increment, the hours since the previous run, and that rate per hour, x24 per day and x168 per week;
+    then the period average (all increments / all their hours, x24 and x168)."""
+    hdr = (f"{'Protection group':<18}{'Last snapshot':<18}{'Increment':>13}{'Interval':>10}{'Per hour':>13}"
+           f"{'Est/day':>13}{'Est/week':>13}  |{'Period growth':>15}{'Over':>9}{'Avg/day':>13}{'Avg/week':>13}  Note")
+    out = [hdr, "-" * len(hdr)]
+    for pg in model.selected(pg_filter):
+        g = pg["growth_last"]
+        if not g:
+            why = ("one measurement so far - the rate needs two runs" if pg["space"] is not None
+                   else "no space measurements in this period")
+            out.append(f"{pg['name'][:17]:<18}{'-':<18}{'-':>13}   ({why})")
+            continue
+        notes = []
+        if g["target_space_interval_hours"] < SHORT_INTERVAL_HOURS:
+            notes.append(f"interval under {SHORT_INTERVAL_HOURS * 60:.0f} min: x24 / x168 estimate unreliable")
+        ps, ns = g.get("target_space_prev_snapshots"), g.get("target_space_snapshots")
+        if ps is not None and ns is not None and ns <= ps:          # each run adds one snapshot
+            n = ps + 1 - ns
+            notes.append(f"net: {n} older snapshot{'s' if n != 1 else ''} expired ({ps}->{ns})")
+        note = "; ".join(notes)
+        out.append(f"{pg['name'][:17]:<18}{g['time']:%Y-%m-%d %H:%M}  {fmt_signed(g['target_space_growth_bytes']):>13}"
+                   f"{fmt_hours(g['target_space_interval_hours']):>10}{fmt_signed(g['target_space_est_hourly_bytes']):>13}"
+                   f"{fmt_signed(g['target_space_est_daily_bytes']):>13}{fmt_signed(g['target_space_est_weekly_bytes']):>13}  |"
+                   f"{fmt_signed(pg['growth_inc']):>15}{fmt_hours(pg['growth_hours']):>9}"
+                   f"{fmt_signed(pg['growth_day']):>13}{fmt_signed(pg['growth_week']):>13}  {note}".rstrip())
     if len(out) == 2:
         out.append("(no runs in this period)")
     return out
@@ -555,6 +738,13 @@ def text_report(report, period, pg_filter=None, summary="auto"):
     out = [f"Pure DR replication report   {report.describe(period)}",
            f"Logs: {report.first} .. {report.last}   (as of {report.today})" if report.first else "No DR data found", ""]
     out += overview_lines(model, pg_filter)
+    out += ["", "SPACE ON TARGET  (space all snapshots of each DR protection group use on the target: the (total) row of",
+            "                  purepgroup list --snap --space <source>:<DR pgroup> --total, read after each run)"]
+    out += space_lines(model, pg_filter)
+    out += ["", "SPACE GROWTH ON TARGET - estimated  (increment = (total) now - (total) after the previous run;",
+            "                  per hour = increment / interval;  Est/day = per hour x 24;  Est/week = per hour x 168;",
+            "                  Avg = all increments in the period / all their hours, x 24 and x 168)"]
+    out += growth_lines(model, pg_filter)
     if period["prev_start"]:
         out += ["", f"PERIOD COMPARISON  {report.describe(period)}", "(chg = change vs the previous period; "
                 "Avg/day chg is the like-for-like comparison)"]
@@ -567,14 +757,345 @@ def text_report(report, period, pg_filter=None, summary="auto"):
             out += [f"[{bk['title']}]"] + cmp_lines(bk["rows"])
     return "\n".join(out)
 
+# ============================================================================ CLI charts (--cli)
+# Text versions of the window's charts: horizontal bars drawn with '#' / '*' and the numbers printed
+# beside each bar. Every section has its own scale, shown in its heading as "1 char = ...".
+SERIES_CHARS = "#*=+o%@~"           # stacked bars: one character per protection group
+
+def series_chars(first):
+    """Fill characters for stacked bars: the chosen --bar-char first, then the others in SERIES_CHARS."""
+    return first + "".join(c for c in SERIES_CHARS if c != first)
+
+def other_char(ch):
+    """Second bar character (previous period / up-to-maximum): '*' normally, '#' when --bar-char is '*'."""
+    return "*" if ch != "*" else "#"
+
+def term_width(width=None):
+    """Output width: --width, else the terminal width (120 when not a terminal); at least 60."""
+    if width:
+        return max(60, width)
+    import shutil
+    return max(60, shutil.get_terminal_size((120, 24)).columns)
+
+def hbar(value, vmax, width, ch):
+    """Bar of `ch` scaled so vmax fills `width` characters; any value above 0 gets at least one."""
+    if not value or not vmax or value <= 0:
+        return ""
+    return ch * min(width, max(1, int(round(value / vmax * width))))
+
+def hstack(values, vmax, width, chars):
+    """Stacked bar: one segment per value, each drawn with its own character (cumulative rounding,
+    so the total length matches hbar of the sum)."""
+    out, cum, drawn = "", 0.0, 0
+    if not vmax:
+        return out
+    for v, c in zip(values, chars):
+        if not v or v <= 0:
+            continue
+        cum += v
+        n = max(1, int(round(cum / vmax * width)) - drawn)
+        out += c * n
+        drawn += n
+    return out[:width]
+
+def hrange(avg, mx, vmax, width, ch, ext):
+    """Average / maximum bar: `ch` up to the average, then `ext` up to the maximum."""
+    a, m = hbar(avg, vmax, width, ch), hbar(mx, vmax, width, ch)
+    return a + ext * max(0, len(m) - len(a))
+
+CLI_DAILY_MAX_DAYS = 45             # longer periods: the per-day charts show one row per week instead
+
+def cli_slots(lo, hi):
+    """Rows for the per-day charts: one per day for periods up to CLI_DAILY_MAX_DAYS days, else one per
+    calendar week (Mon-Sun, clipped to lo..hi). -> (unit name, [(label, first day, last day, n days)])."""
+    if not lo:
+        return "day", []
+    if (hi - lo).days + 1 <= CLI_DAILY_MAX_DAYS:
+        return "day", [(f"{d:%Y-%m-%d %a}", d, d, 1) for d in (lo + D(days=i) for i in range((hi - lo).days + 1))]
+    out = []
+    for ws, we in bucket_ranges("week", lo, hi):
+        a, b = max(ws, lo), min(we, hi)
+        out.append((f"wk {a:%Y-%m-%d}", a, b, (b - a).days + 1))
+    return "week", out
+
+def cli_section(title, rows, W):
+    """Render one chart section.
+    title: function(bar_width) -> heading text (so the heading can show the scale); a second line
+           after "\n" is printed as a legend;
+    rows:  ("text", line) for a sub-heading, or (label, tag, bar_function(bar_width), numbers)."""
+    bars = [r for r in rows if len(r) == 4]
+    if not bars:
+        return []
+    lw = min(32, max(max(len(r[0]) for r in bars), 8))
+    tw = max(len(r[1]) for r in bars)
+    nw = max(len(r[3]) for r in bars)
+    bw = max(20, W - (2 + lw + 1 + (tw + 1 if tw else 0) + 2 + 1) - nw)    # bar width (min 20)
+    head = title(bw).split("\n")                       # heading, optionally with a legend line
+    out = ["", *head, "-" * min(W, max(len(h) for h in head))]
+    for r in rows:
+        if len(r) != 4:
+            out.append(r[1])
+            continue
+        label, tag, fn, text = r
+        tagtxt = f"{tag:>{tw}} " if tw else ""
+        out.append(f"  {label[:lw]:<{lw}} {tagtxt}|{fn(bw):<{bw}}| {text}".rstrip())
+    return out
+
+def cli_report(report, period, pg_filter=None, summary="auto", width=None, ch="#"):
+    """--cli: the text report drawn as ASCII bar charts with the numbers beside every bar:
+    Overview table, DR volume sizes, daily change (stacked by protection group), change rate as % of
+    size, replication time per day and per volume (average + maximum), the period compared with the
+    previous period, and weekly / monthly totals with the change versus the previous week / month."""
+    W = term_width(width)
+    ext = other_char(ch)
+    chars = series_chars(ch)
+    model = report.model_for(period)
+    pgs = model.selected(pg_filter)
+    pg_char = {n: chars[i % len(chars)] for i, n in enumerate(report.all_model.pgroups)}
+    legend = "   ".join(f"{pg_char[pg['name']]} = {pg['name']}" for pg in pgs)
+    out = [f"Pure DR replication report   {report.describe(period)}",
+           f"Logs: {report.first} .. {report.last}   (as of {report.today})" if report.first else "No DR data found",
+           "", "OVERVIEW", "-" * 8]
+    out += overview_lines(model, pg_filter)
+    if not pgs:
+        return "\n".join(out)
+
+    # ---- DR volume sizes
+    rows = []
+    for pg in pgs:
+        vols = [v for v in pg["volumes"].values() if v["size"]]
+        if vols:
+            rows.append(("text", f"{pg['name']} -> {pg['dr_pgroup']}   total {fmt_bytes(pg['size'])}"))
+            rows += [(v["name"], "", lambda bw, v=v: hbar(v["size"], vmax, bw, ch), fmt_bytes(v["size"]))
+                     for v in vols]
+    vmax = max([v["size"] for pg in pgs for v in pg["volumes"].values() if v["size"]] or [0])
+    out += cli_section(lambda bw: f"DR VOLUME SIZES   (1 {ch} = {fmt_bytes(vmax / bw)})", rows, W)
+
+    # rows of the per-day charts: one per day (one per week for periods over CLI_DAILY_MAX_DAYS days)
+    lo, hi = report.date_range(period["start"], period["end"])
+    unit, slots = cli_slots(lo, hi)
+    in_slot = lambda d, sl: sl[1] <= d <= sl[2]
+
+    # ---- space used on the target by each protection group's snapshots: latest, then per day / week
+    spgs = [pg for pg in pgs if pg["space"] is not None]
+    smax = max([pg["space_max"] for pg in spgs] or [0])
+    rows = [(pg["name"], "", lambda bw, pg=pg: hbar(pg["space"], smax, bw, ch),
+             f"{fmt_bytes(pg['space'])}  {pg['space']:,.0f} bytes  {pg['space_snaps'] if pg['space_snaps'] is not None else '-'} "
+             f"snapshots  {pg['target_pgroup'] or pg['dr_pgroup']}  {pg['space_time']:%Y-%m-%d %H:%M}"
+             + (f"  change {fmt_delta(pg['space_change'])}" if pg["space_change"] is not None else ""))
+            for pg in spgs]
+    rows += [(pg["name"], "", lambda bw: "", "not recorded in this period") for pg in pgs if pg["space"] is None]
+    if spgs:
+        out += cli_section(lambda bw: f"SPACE ON TARGET - latest, all snapshots of each protection group   "
+                                      f"(1 {ch} = {fmt_bytes(smax / bw)})", rows, W)
+
+    # ---- estimated growth of that space: latest snapshot (now) and period average (avg), per day
+    gpgs = [pg for pg in pgs if pg["growth_last"]]
+    gmax = max([x for pg in gpgs for x in (pg["growth_last"]["target_space_est_daily_bytes"], pg["growth_day"])
+                if x and x > 0] or [0])
+    rows = []
+    for pg in gpgs:
+        g = pg["growth_last"]
+        rows.append((pg["name"], "last", lambda bw, x=g["target_space_est_daily_bytes"]: hbar(x, gmax, bw, ch),
+                     f"{fmt_signed(g['target_space_est_daily_bytes'])}/day  {fmt_signed(g['target_space_est_weekly_bytes'])}/week"
+                     f"   (snapshot {g['time']:%Y-%m-%d %H:%M}: {fmt_signed(g['target_space_growth_bytes'])} in "
+                     f"{fmt_hours(g['target_space_interval_hours'])})"
+                     + ("  short interval: estimate unreliable"
+                        if g["target_space_interval_hours"] < SHORT_INTERVAL_HOURS else "")))
+        rows.append(("", "avg", lambda bw, x=pg["growth_day"]: hbar(x, gmax, bw, ext),
+                     f"{fmt_signed(pg['growth_day'])}/day  {fmt_signed(pg['growth_week'])}/week"
+                     f"   (period: {fmt_signed(pg['growth_inc'])} over {fmt_hours(pg['growth_hours'])}, "
+                     f"{pg['growth_n']} snapshot{'s' if pg['growth_n'] != 1 else ''})"))
+    if gpgs:
+        out += cli_section(lambda bw: f"SPACE GROWTH ON TARGET - estimated per day   (per hour = increment / hours since "
+                                      f"the previous run; x24 per day, x168 per week;  1 char = {fmt_bytes(gmax / bw)})\n"
+                                      f"  {ch} last = latest snapshot    {ext} avg = period average", rows, W)
+
+    # ---- space on the target per day (or week): the last measurement in each row, change vs the row before
+    first_sp = min((t.date() for pg in spgs for t, _ in pg["space_series"]), default=None)
+    sp_slots = [sl for sl in slots if first_sp and sl[2] >= first_sp]      # start at the first measurement
+    if spgs and sp_slots:
+        rows = []
+        for pg in spgs:
+            rows.append(("text", f"{pg['name']} -> {pg['target_pgroup'] or pg['dr_pgroup']}   latest "
+                                 f"{fmt_bytes(pg['space'])}, maximum {fmt_bytes(pg['space_max'])}"))
+            prev = None
+            for sl in sp_slots:
+                vals = [b for t, b in pg["space_series"] if in_slot(t.date(), sl)]
+                if not vals:
+                    rows.append((sl[0], "", lambda bw: "", "-"))
+                    continue
+                v = vals[-1]
+                rows.append((sl[0], "", lambda bw, v=v: hbar(v, smax, bw, ch),
+                             f"{fmt_bytes(v)}" + (f"  {fmt_delta(v - prev)}" if prev is not None else "")))
+                prev = v
+        out += cli_section(lambda bw: f"SPACE ON TARGET PER {unit.upper()} - last measurement, change vs the "
+                                      f"{unit} before   (1 {ch} = {fmt_bytes(smax / bw)})", rows, W)
+
+    # ---- daily change, stacked by protection group (every calendar day, so missed days show;
+    #      periods over CLI_DAILY_MAX_DAYS days show one row per week = average per day of that week)
+    fails_on = collections.Counter(r["time"].date() for pg in pgs for r in pg_runs(pg) if r.get("status") == "failed")
+    if slots:
+        vals = {sl: [sum(b for d, b in pg["daily"].items() if in_slot(d, sl)) / sl[3] for pg in pgs] for sl in slots}
+        dmax = max(sum(v) for v in vals.values())
+        cs = [pg_char[pg["name"]] for pg in pgs]
+        rows = []
+        for sl in slots:
+            tot = sum(vals[sl])
+            nf = sum(n for d, n in fails_on.items() if in_slot(d, sl))
+            txt = (fmt_bytes(tot) + ("/day" if unit == "week" else "")) if tot else "no successful run"
+            txt += f"   {nf} failed" if nf else ""
+            rows.append((sl[0], "", lambda bw, sl=sl: hstack(vals[sl], dmax, bw, cs), txt))
+        ndays = sum(sl[3] for sl in slots)
+        total = sum(v * sl[3] for sl in slots for v in vals[sl])
+        rows.append(("text", f"  Average {fmt_bytes(total / ndays)}/day over {ndays} days; total {fmt_bytes(total)}"))
+        what = "data replicated per day" if unit == "day" else "average per day, one row per week"
+        if dmax:
+            out += cli_section(lambda bw: f"DAILY CHANGE - {what}   (1 char = {fmt_bytes(dmax / bw)};  {legend})",
+                               rows, W)
+
+    # ---- average daily change rate as % of size
+    rows = []
+    for pg in pgs:
+        vols = [v for v in pg["volumes"].values() if v["change_pct"] is not None]
+        if vols:
+            rows.append(("text", f"{pg['name']} -> {pg['dr_pgroup']}   group: "
+                                 + (f"{pg['change_pct']:.2f}%/day  ({fmt_bytes(pg['avg_daily'])}/day)"
+                                    if pg["change_pct"] is not None else "-")))
+            rows += [(v["name"], "", lambda bw, v=v: hbar(v["change_pct"], pmax, bw, ch),
+                      f"{v['change_pct']:.2f}%/day  ({fmt_bytes(v['avg_daily'])}/day)") for v in vols]
+    pmax = max([v["change_pct"] for pg in pgs for v in pg["volumes"].values() if v["change_pct"] is not None] or [0])
+    out += cli_section(lambda bw: f"AVERAGE DAILY CHANGE RATE - % of volume size per day   (1 {ch} = {pmax / bw:.3f}%)",
+                       rows, W)
+
+    # ---- replication time per day per protection group (average and maximum)
+    rows, tmax = [], 0
+    for pg in pgs:
+        by_day = collections.defaultdict(list)
+        nfail = collections.Counter()
+        for r in pg_runs(pg):
+            if r.get("status") == "ok" and r.get("seconds") is not None:
+                by_day[r["time"].date()].append(r["seconds"])
+            elif r.get("status") == "failed":
+                nfail[r["time"].date()] += 1
+        if not by_day and not nfail:
+            continue
+        rows.append(("text", f"{pg['name']} -> {pg['dr_pgroup']}   average {fmt_secs(pg['avg_secs'])}, "
+                             f"maximum {fmt_secs(pg['max_secs'])}"))
+        for sl in slots:
+            secs = [x for d, xs in by_day.items() if in_slot(d, sl) for x in xs]
+            nf = sum(n for d, n in nfail.items() if in_slot(d, sl))
+            a, m = mean(secs), (max(secs) if secs else None)
+            tmax = max(tmax, m or 0)
+            txt = (f"avg {fmt_secs(a)}  max {fmt_secs(m)}  {len(secs)} run{'s' if len(secs) != 1 else ''}"
+                   if secs else "no successful run")
+            txt += f"   {nf} failed" if nf else ""
+            rows.append((sl[0], "", lambda bw, a=a, m=m: hrange(a, m, tmax, bw, ch, ext), txt))
+    out += cli_section(lambda bw: f"REPLICATION TIME PER {unit.upper()}   ({ch} = average, {ext} = up to maximum;"
+                                  f"  1 char = {fmt_secs(tmax / bw)})", rows, W)
+
+    # ---- replication time per volume (average and maximum)
+    rows = []
+    for pg in pgs:
+        vols = [v for v in pg["volumes"].values() if v["avg_secs"] is not None]
+        if vols:
+            rows.append(("text", f"{pg['name']} -> {pg['dr_pgroup']}"))
+            rows += [(v["name"], "", lambda bw, v=v: hrange(v["avg_secs"], v["max_secs"], vmx, bw, ch, ext),
+                      f"avg {fmt_secs(v['avg_secs'])}  max {fmt_secs(v['max_secs'])}") for v in vols]
+    vmx = max([v["max_secs"] for pg in pgs for v in pg["volumes"].values() if v["max_secs"] is not None] or [0])
+    out += cli_section(lambda bw: f"REPLICATION TIME PER VOLUME   ({ch} = average, {ext} = up to maximum;"
+                                  f"  1 char = {fmt_secs(vmx / bw)})", rows, W)
+
+    # ---- this period vs the previous period (average per day, like-for-like)
+    if period["prev_start"]:
+        cmp_rows = report.comparison(period, pg_filter)
+        cmax = max([x for r in cmp_rows for x in (r["cur"]["per_day"], (r["prev"] or {}).get("per_day")) if x]
+                   or [0])
+        rows = []
+        for r in cmp_rows:
+            c, pv = r["cur"], r["prev"] or {}
+            label = r["label"] if r["volume"] is None else "  " + r["label"]
+            rows.append((label, "now", lambda bw, x=c["per_day"]: hbar(x, cmax, bw, ch),
+                         f"{fmt_bytes(c['per_day'])}/day  {fmt_pct(r['chg']['per_day'])}  "
+                         f"(total {fmt_bytes(c['data'])}, {c['n_ok']}/{c['n_fail']} ok/failed)"))
+            rows.append(("", "prev", lambda bw, x=pv.get("per_day"): hbar(x, cmax, bw, ext),
+                         f"{fmt_bytes(pv.get('per_day'))}/day  (total {fmt_bytes(pv.get('data'))})"))
+        if cmax:
+            ps, pe = period["prev_start"], period["prev_end"]
+            cs_, ce_ = period["start"] or report.first, period["end"] or report.today
+            out += cli_section(lambda bw: f"PERIOD COMPARISON - average data replicated per day   "
+                                          f"(1 char = {fmt_bytes(cmax / bw)})\n"
+                                          f"  {ch} now  = this period {cs_:%Y-%m-%d} .. {ce_:%Y-%m-%d}    "
+                                          f"{ext} prev = previous {ps:%Y-%m-%d} .. {pe:%Y-%m-%d}", rows, W)
+
+    # ---- weekly / monthly: bar = average per day (fair for partial weeks / months), numbers = totals
+    for kind in summary_kinds(summary, report, period):
+        buckets = report.buckets(kind, period, pg_filter)
+        if not buckets:
+            continue
+        unit = "week" if kind == "week" else "month"
+        name = "WEEKLY (Mon-Sun)" if kind == "week" else "MONTHLY"
+        lab = (lambda bk: f"{iso_week(bk['start'])} {bk['start']:%b %d}") if kind == "week" else \
+              (lambda bk: f"{bk['start']:%b %Y}")
+        busy = lambda bk: "  (in progress)" if bk["partial"] else ""
+        grow = lambda bk, n: next((r for r in bk["rows"] if r["pg"] == n and r["volume"] is None), None)
+        cur = lambda bk, n, k: ((grow(bk, n) or {}).get("cur") or {}).get(k)
+        names = [pg["name"] for pg in pgs]
+
+        if len(names) > 1:                                          # all groups, stacked
+            vals = {id(bk): [cur(bk, n, "per_day") or 0 for n in names] for bk in buckets}
+            smax = max([sum(v) for v in vals.values()] or [0])
+            rows = []
+            for bk in buckets:
+                tot = sum(vals[id(bk)])
+                prev = _sum(((grow(bk, n) or {}).get("prev") or {}).get("per_day") for n in names)
+                rows.append((lab(bk), "", lambda bw, bk=bk: hstack(vals[id(bk)], smax, bw, [pg_char[n] for n in names]),
+                             f"{fmt_bytes(tot)}/day  {fmt_pct(pct(tot, prev)):>5}  total "
+                             f"{fmt_bytes(_sum(cur(bk, n, 'data') for n in names))}{busy(bk)}"))
+            if smax:
+                out += cli_section(lambda bw: f"{name} - all protection groups, average per day   "
+                                              f"(1 char = {fmt_bytes(smax / bw)};  {legend})", rows, W)
+
+        wmax = max([cur(bk, n, "per_day") or 0 for bk in buckets for n in names] or [0])
+        rows = [("text", f"  avg/day, change vs previous {unit}, total, replication time avg/max, ok/failed runs, "
+                         f"space on target at the end of the {unit} (estimated growth per day)")]
+        for n in names:
+            pg = next(pg for pg in pgs if pg["name"] == n)
+            rows.append(("text", f"{n} -> {pg['dr_pgroup']}"))
+            for bk in buckets:
+                r = grow(bk, n)
+                if not r:
+                    rows.append((lab(bk), "", lambda bw: "", "no runs" + busy(bk)))
+                    continue
+                c = r["cur"]
+                rows.append((lab(bk), "", lambda bw, x=c["per_day"]: hbar(x, wmax, bw, ch),
+                             f"{fmt_bytes(c['per_day'])}/day {fmt_pct(r['chg']['per_day']):>5}  "
+                             f"tot {fmt_bytes(c['data'])}  {fmt_secs(c['avg_secs'])}/{fmt_secs(c['max_secs'])}  "
+                             f"{c['n_ok']}/{c['n_fail']}"
+                             + (f"  space {fmt_bytes(c['space'])}" if c.get("space") is not None else "")
+                             + (f" ({fmt_signed(c['growth_day'])}/day)" if c.get("growth_day") is not None else "")
+                             + busy(bk)))
+        if wmax:
+            out += cli_section(lambda bw: f"{name} - by protection group, average per day   "
+                                          f"(1 {ch} = {fmt_bytes(wmax / bw)})", rows, W)
+    return "\n".join(out)
+
+
 # Per-run CSV columns (one row per DRDATA record; time = run start)
 RUN_COLS = ["time", "run", "source_pgroup", "dr_pgroup", "volume", "source_volume", "status",
-            "size_bytes", "data_bytes", "written_bytes", "seconds", "time_source", "error"]
+            "size_bytes", "data_bytes", "written_bytes", "seconds", "time_source",
+            "target_pgroup", "target_space_bytes", "target_space_snapshots", "target_space_growth_bytes",
+            "target_space_interval_hours", "target_space_est_hourly_bytes", "target_space_est_daily_bytes",
+            "target_space_est_weekly_bytes", "error"]
 SUM_COLS = ["protection_group", "dr_pgroup", "level", "volume", "days", "data_bytes", "data_gib",
             "avg_per_day_bytes", "avg_per_day_gib", "avg_seconds", "avg_time", "max_seconds", "max_time",
             "ok_runs", "failed_runs", "prev_days", "prev_data_bytes", "prev_data_gib", "prev_avg_per_day_bytes",
             "prev_avg_per_day_gib", "prev_avg_seconds", "prev_max_seconds", "prev_ok_runs", "prev_failed_runs",
-            "data_change_pct", "avg_per_day_change_pct", "avg_time_change_pct"]
+            "data_change_pct", "avg_per_day_change_pct", "avg_time_change_pct",
+            "target_space_bytes", "target_space_gib", "target_space_snapshots", "target_space_measured",
+            "prev_target_space_bytes", "target_space_change_bytes", "target_space_change_pct",
+            "target_space_growth_bytes", "target_space_growth_hours", "target_space_est_daily_bytes",
+            "target_space_est_weekly_bytes", "prev_target_space_est_daily_bytes", "target_space_est_daily_change_pct"]
 
 def _csv_row(row):
     """One comparison row -> CSV dict (bytes and GiB, seconds and H:MM:SS, change %)."""
@@ -593,7 +1114,19 @@ def _csv_row(row):
             "prev_avg_seconds": rnd(p.get("avg_secs")), "prev_max_seconds": rnd(p.get("max_secs")),
             "prev_ok_runs": p.get("n_ok", ""), "prev_failed_runs": p.get("n_fail", ""),
             "data_change_pct": rnd(d["data"], 1), "avg_per_day_change_pct": rnd(d["per_day"], 1),
-            "avg_time_change_pct": rnd(d["avg_secs"], 1)}
+            "avg_time_change_pct": rnd(d["avg_secs"], 1),
+            "target_space_bytes": rnd(c.get("space")), "target_space_gib": gib(c.get("space")),
+            "target_space_snapshots": "" if c.get("space_snaps") is None else c["space_snaps"],
+            "target_space_measured": c["space_time"].isoformat(sep=" ") if c.get("space_time") else "",
+            "prev_target_space_bytes": rnd(p.get("space")),
+            "target_space_change_bytes": rnd(c["space"] - p["space"]) if c.get("space") is not None
+                                         and p.get("space") is not None else "",
+            "target_space_change_pct": rnd(d.get("space"), 1),
+            "target_space_growth_bytes": rnd(c.get("growth")), "target_space_growth_hours": rnd(c.get("growth_hours"), 2),
+            "target_space_est_daily_bytes": rnd(c.get("growth_day")),
+            "target_space_est_weekly_bytes": rnd(c.get("growth_week")),
+            "prev_target_space_est_daily_bytes": rnd(p.get("growth_day")),
+            "target_space_est_daily_change_pct": rnd(d.get("growth_day"), 1)}
 
 def export_csv(report, period, path, pg_filter=None):
     """Per-run CSV for the period + <name>_period.csv, <name>_weekly.csv, <name>_monthly.csv."""
@@ -607,7 +1140,11 @@ def export_csv(report, period, path, pg_filter=None):
         w.writeheader()
         for r in report.window(period["start"], period["end"]):
             if keep(r):
-                w.writerow({**r, "time": r["time"].isoformat(sep=" ")})
+                rnd = lambda k, n=0: "" if r.get(k) is None else (round(r[k]) if n == 0 else round(r[k], n))
+                w.writerow({**r, "time": r["time"].isoformat(sep=" "),
+                            **{k: rnd(k) for k in ("target_space_growth_bytes", "target_space_est_hourly_bytes",
+                                                   "target_space_est_daily_bytes", "target_space_est_weekly_bytes")},
+                            "target_space_interval_hours": rnd("target_space_interval_hours", 4)})
     written.append(str(p))
 
     path_p = f"{base}_period.csv"
@@ -830,10 +1367,77 @@ def chart_buckets(report, fig, period, pg_filter=None, kind="week"):
     ax2.spines[["top", "right"]].set_visible(False)
     fig.tight_layout()
 
-CHARTS = [("Sizes", chart_sizes), ("Daily change", chart_daily), ("Replication time", chart_repl_time)]
+def chart_space(model, fig, pg_filter=None):
+    """Target space tab: top = space each protection group's snapshots use on the target, per run;
+    middle = estimated growth per day of that space for each snapshot (increment / hours x 24), with the
+    period average dashed; bottom = latest total per protection group with its estimated daily / weekly growth."""
+    fig.clear()
+    pgs = [pg for pg in model.selected(pg_filter) if pg["space_series"]]
+    if not pgs:
+        return _empty(fig, "No space-on-target measurements in this period\n(recorded by pg_dr_refresh.py "
+                           "after monitoring: purepgroup list --snap --space <pgroup> --total)")
+    pg_col, _ = palette(model)
+    ax1 = fig.add_subplot(311)
+    for pg in pgs:
+        ax1.plot([t for t, _ in pg["space_series"]], [_gib(b) for _, b in pg["space_series"]], marker="o", ms=3,
+                 color=pg_col[pg["name"]], label=f"{pg['name']} -> {pg['target_pgroup'] or pg['dr_pgroup']}")
+    ax1.set_ylabel("Total (GiB)")
+    ax1.set_title("Space used on the target by each protection group's snapshots (per run)",
+                  loc="left", fontweight="bold", fontsize=10)
+    ax1.legend(fontsize=8, frameon=False, loc="upper left", bbox_to_anchor=(1.0, 1.0))
+    ax1.set_ylim(bottom=0)
+    ax1.spines[["top", "right"]].set_visible(False)
+
+    ax2 = fig.add_subplot(312, sharex=ax1)
+    for pg in pgs:
+        if pg["growth_series"]:
+            ax2.plot([t for t, _ in pg["growth_series"]], [(b or 0) / 1024**3 for _, b in pg["growth_series"]],
+                     marker="o", ms=3, color=pg_col[pg["name"]], label=f"{pg['name']} per snapshot")
+        if pg["growth_day"] is not None:
+            ax2.axhline(pg["growth_day"] / 1024**3,
+                        ls="--", lw=1, color=pg_col[pg["name"]], alpha=0.7,
+                        label=f"{pg['name']} average {fmt_signed(pg['growth_day'])}/day")
+    ax2.axhline(0, color="#999", lw=0.6)
+    ax2.set_ylabel("GiB per day (est.)")
+    ax2.set_title("Estimated space growth on the target per day   (each snapshot: increment / hours since the "
+                  "previous run x 24)", loc="left", fontweight="bold", fontsize=10)
+    if any(pg["growth_series"] for pg in pgs):
+        ax2.legend(fontsize=8, frameon=False, loc="upper left", bbox_to_anchor=(1.0, 1.0))
+    else:
+        ax2.text(0.5, 0.5, "Needs two measured runs per protection group", ha="center", transform=ax2.transAxes)
+    ax2.spines[["top", "right"]].set_visible(False)
+    for lbl in ax1.get_xticklabels():
+        lbl.set_visible(False)
+    for lbl in ax2.get_xticklabels():
+        lbl.set_rotation(20); lbl.set_ha("right"); lbl.set_fontsize(8)
+
+    ax3 = fig.add_subplot(313)
+    rows = pgs[::-1]
+    bars = ax3.barh([pg["name"] for pg in rows], [_gib(pg["space"]) for pg in rows],
+                    color=[pg_col[pg["name"]] for pg in rows])
+    for b, pg in zip(bars, rows):
+        g = pg["growth_last"] or {}
+        txt = f"  {fmt_bytes(pg['space'])} ({pg['space']:,.0f} bytes"
+        txt += f", {pg['space_snaps']} snapshots)" if pg["space_snaps"] is not None else ")"
+        if g:
+            txt += (f"   est. {fmt_signed(g['target_space_est_daily_bytes'])}/day, "
+                    f"{fmt_signed(g['target_space_est_weekly_bytes'])}/week (last snapshot)")
+        if pg["growth_day"] is not None:
+            txt += f";  avg {fmt_signed(pg['growth_day'])}/day, {fmt_signed(pg['growth_week'])}/week"
+        ax3.text(b.get_width(), b.get_y() + b.get_height() / 2, txt, va="center", fontsize=8)
+    ax3.set_xlim(0, max(_gib(pg["space"]) for pg in rows) * 3.2)
+    ax3.set_xlabel("GiB")
+    last = max(pg["space_time"] for pg in pgs)
+    ax3.set_title(f"Latest space on target and estimated growth (as of {last:%Y-%m-%d %H:%M})",
+                  loc="left", fontweight="bold", fontsize=10)
+    ax3.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+
+CHARTS = [("Sizes", chart_sizes), ("Daily change", chart_daily), ("Replication time", chart_repl_time),
+          ("Target space", chart_space)]
 
 def export_png(report, period, outdir, pg_filter=None):
-    """Save the Sizes, Daily change, Replication time, Weekly and Monthly charts for the period as PNGs
+    """Save the Sizes, Daily change, Replication time, Target space, Weekly and Monthly charts as PNGs
     (uses the non-GUI Agg backend, so it works without Tk or a display). Returns the file paths."""
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg      # no GUI backend needed
@@ -865,7 +1469,7 @@ def run_gui(args, files, report, period_key, custom):
 
     root = tk.Tk()
     root.title("Pure DR Replication Report")
-    root.geometry("1320x860")
+    root.geometry("1420x860")
     state = {"files": files, "report": report, "model": None, "period": None}
 
     # ---- row 1: data info + file actions
@@ -904,13 +1508,14 @@ def run_gui(args, files, report, period_key, custom):
 
     # ---- overview tab (tree)
     ov = ttk.Frame(nb); nb.add(ov, text="Overview")
-    cols = ("size", "avg", "pct", "peak", "lastdata", "lasttime", "avgtime", "maxtime", "runs", "status")
-    heads = ("Size", "Avg change/day", "%/day", "Peak day", "Last replicated", "Last time",
-             "Avg time", "Max time", "OK / Failed", "Last status")
+    cols = ("size", "space", "gday", "gweek", "avg", "pct", "peak", "lastdata", "lasttime", "avgtime", "maxtime",
+            "runs", "status")
+    heads = ("Size", "Space on target", "Target est./day", "Target est./week", "Avg change/day", "%/day",
+             "Peak day", "Last replicated", "Last time", "Avg time", "Max time", "OK / Failed", "Last status")
     tree = ttk.Treeview(ov, columns=cols, show="tree headings")
-    tree.heading("#0", text="Protection group / volume"); tree.column("#0", width=260)
+    tree.heading("#0", text="Protection group / volume"); tree.column("#0", width=240)
     for c, h in zip(cols, heads):
-        tree.heading(c, text=h); tree.column(c, width=105, anchor="e")
+        tree.heading(c, text=h); tree.column(c, width=90, minwidth=60, anchor="e")
     tree.column("status", anchor="center")
     tree.tag_configure("pg", font=("TkDefaultFont", 10, "bold"))
     tree.tag_configure("failed", foreground="#c62828")
@@ -960,7 +1565,12 @@ def run_gui(args, files, report, period_key, custom):
     def values(o):
         """Overview tree cell values for one pgroup or volume."""
         last = o["last"] or {}
-        return (fmt_bytes(o["size"]), fmt_bytes(o["avg_daily"]),
+        is_pg = "volumes" in o                                              # per protection group only
+        gl = (o["growth_last"] or {}) if is_pg else {}
+        space = fmt_bytes(o["space"]) if is_pg else ""
+        gday = fmt_signed(gl.get("target_space_est_daily_bytes")) if is_pg else ""
+        gweek = fmt_signed(gl.get("target_space_est_weekly_bytes")) if is_pg else ""
+        return (fmt_bytes(o["size"]), space, gday, gweek, fmt_bytes(o["avg_daily"]),
                 f"{o['change_pct']:.2f}%" if o["change_pct"] is not None else "-",
                 fmt_bytes(o["peak_daily"]), fmt_bytes(last.get("data_bytes")), fmt_secs(last.get("seconds")),
                 fmt_secs(o["avg_secs"]), fmt_secs(o["max_secs"]), f"{o['n_ok']} / {o['n_fail']}", o["last_status"])
@@ -1100,11 +1710,21 @@ def main():
                     help="weekly/monthly section in the text report (auto: weekly for periods under "
                          "5 weeks, else monthly); also the initial Weekly / Monthly tab grouping")
     ap.add_argument("--pgroup", help="only this protection group (GUI: start with it selected)")
-    ap.add_argument("--no-gui", action="store_true", help="print a text report instead of opening a window")
+    ap.add_argument("--no-gui", action="store_true", help="print a text report (tables) instead of opening a window")
+    ap.add_argument("--cli", action="store_true",
+                    help="print the report in the terminal only: tables plus bar charts drawn with '#' / '*' "
+                         "and the numbers beside each bar (no window, no matplotlib needed)")
+    ap.add_argument("--bar-char", default="#", metavar="C",
+                    help="character for --cli bars (default '#'; '*' also common). Previous-period and "
+                         "up-to-maximum bars use '*' (or '#' when C is '*')")
+    ap.add_argument("--width", type=int, metavar="N",
+                    help="--cli output width in characters (default: terminal width, 120 when piped)")
     ap.add_argument("--export-png", metavar="DIR", help="save the charts as PNG files to DIR")
     ap.add_argument("--export-csv", metavar="FILE",
                     help="save per-run data to FILE, plus FILE_period.csv, FILE_weekly.csv, FILE_monthly.csv")
     args = ap.parse_args()
+    if len(args.bar_char) != 1 or args.bar_char.isspace():
+        ap.error("--bar-char must be one visible character, e.g. '#' or '*'")
 
     chosen = [bool(args.period), bool(args.date_from or args.date_to), bool(args.days)]
     if sum(chosen) > 1:
@@ -1130,6 +1750,9 @@ def main():
                      "or 'pip install matplotlib' inside a virtual environment - see README.md")
         for p in export_png(report, period, args.export_png, args.pgroup):
             print(f"PNG written: {p}")
+    if args.cli:
+        print(cli_report(report, period, args.pgroup, args.summary, args.width, args.bar_char))
+        return
     if args.no_gui or args.export_png or args.export_csv:
         if args.no_gui:
             print(text_report(report, period, args.pgroup, args.summary))
@@ -1154,4 +1777,9 @@ def main():
         print(text_report(report, period, args.pgroup, args.summary))
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        sys.stdout.flush()               # flush here so a closed pipe is caught below
+    except BrokenPipeError:              # output piped to head / less that closed early - exit quietly
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
