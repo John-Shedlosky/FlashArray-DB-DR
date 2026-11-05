@@ -20,8 +20,28 @@
 
   "target_array": {
     // Purity name of the replication target, exactly as shown by
-    // `purearray connection list` on the source. The script never SSHes to this array.
-    "name": "flasharray2"
+    // `purearray connection list` on the source.
+    "name": "flasharray2",
+
+    // The settings below are used only by --setup, to connect the arrays when they
+    // aren't connected yet. A normal refresh run never SSHes to the target.
+    //
+    // Management FQDN, DNS alias, or management VIP/IP of the target. --setup SSHes here
+    // to read the connection key (purearray list --connection-key --encrypted), then runs
+    // purearray connect --management-address <host> on the source. Defaults to "name".
+    "host": "flasharray2",
+
+    // Purity user and private key for SSH logins to the target. If left out, the
+    // source_array values are used. The user must be allowed to list the connection key.
+    "ssh_user": "jjones",
+    "ssh_key": "~/.ssh/id_rsa_pure",
+
+    // true  = encrypted replication connection (purearray connect --encrypted), Purity//FA 6.6.7+.
+    // false = unencrypted connection, for older Purity releases.
+    "encrypted": true,
+
+    // Replication network: "ip" (default) or "fc".
+    "replication_transport": "ip"
   },
 
   // ------------------------------------------------------------------ log --

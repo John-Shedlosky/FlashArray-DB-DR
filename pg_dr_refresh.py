@@ -24,8 +24,9 @@ For every protection group (pgroup) listed in the JSON config, in order:
 Snapshot lifetime follows the retention policy already set on each pgroup on the array
 (--apply-retention), so the script never deletes snapshots itself.
 
-Only the SOURCE array is contacted (over SSH). The replication target is named in the config so the
-script can check it is connected and label the logs; the script never logs in to it.
+A refresh run contacts only the SOURCE array (over SSH). The replication target is named in the config so
+the script can check it is connected and label the logs. Only --setup also logs in to the TARGET array,
+to read its connection key when the two arrays aren't connected yet.
 
 Replication progress
 --------------------
@@ -48,7 +49,8 @@ Usage
   pg_dr_refresh.py -c pg_dr_config.json            # normal run
   pg_dr_refresh.py -c pg_dr_config.json -V         # verbose: commands, array output, progress bars
   pg_dr_refresh.py -c pg_dr_config.json --dry-run  # log the commands that would run; change nothing
-  pg_dr_refresh.py -c pg_dr_config.json --setup    # one-time: create the volumes, then the pgroups + target
+  pg_dr_refresh.py -c pg_dr_config.json --setup    # one-time: connect the arrays, create the volumes,
+                                                   # then the pgroups + target
 
 Exit code: 0 = every pgroup succeeded, 1 = at least one pgroup failed, 2 = config / usage error.
 
@@ -132,13 +134,15 @@ class FlashArray:
         self.host, self.name, self.user, self.key = host, name, user, key
         self.ssh_timeout, self.dry_run = ssh_timeout, dry_run
 
-    def run(self, cmd, quiet=False, check=True, read_only=False):
+    def run(self, cmd, quiet=False, check=True, read_only=False, stdin=None, secret=False):
         """Run one Purity CLI command over SSH and return its stdout.
         The command and the array's output always go to the log file; the console shows them only
         with -V (quiet=True keeps them file-only, used for repeated progress polls).
         Raises CLIError on SSH failure, timeout, or a non-zero exit (unless check=False).
         In dry-run mode the command is only logged and "" is returned, unless read_only=True
-        (list commands that change nothing, which --setup --dry-run runs to preview accurately)."""
+        (list commands that change nothing, which --setup --dry-run runs to preview accurately).
+        stdin = text sent to the command's prompt (e.g. a connection key), never logged.
+        secret = True keeps the command's output out of the log (e.g. a connection key)."""
         lg = flog if quiet else log
         lg.debug(f"CMD [{self.name}] $ {cmd}")
         if self.dry_run and not read_only:
@@ -148,13 +152,17 @@ class FlashArray:
             ssh += ["-i", str(Path(self.key).expanduser())]
         ssh += [f"{self.user}@{self.host}", cmd]
         try:
-            r = subprocess.run(ssh, capture_output=True, text=True, timeout=self.ssh_timeout)
+            r = subprocess.run(ssh, capture_output=True, text=True, timeout=self.ssh_timeout,
+                               input=stdin if stdin is not None else None,
+                               stdin=None if stdin is not None else subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
             raise CLIError(f"[{self.name}] timed out after {self.ssh_timeout}s: {cmd}")
         except OSError as e:                                    # e.g. no 'ssh' program on the PATH
             raise CLIError(f"[{self.name}] can't run ssh ({e}); install the OpenSSH client")
         out, err = r.stdout.rstrip(), r.stderr.strip()
-        if out:
+        if out and secret:
+            lg.debug(f"OUT [{self.name}] (not logged: contains a connection key)")
+        elif out:
             lg.debug(f"OUT [{self.name}]\n" + "\n".join("    " + l for l in out.splitlines()))
         if err:
             lg.debug(f"ERR [{self.name}] {err}")
@@ -230,6 +238,10 @@ def load_config(path):
         errs.append("source_array.host is required")
     if not tgt.get("name"):
         errs.append("target_array.name is required")
+    if "encrypted" in tgt and not isinstance(tgt["encrypted"], bool):
+        errs.append("target_array.encrypted must be true or false")
+    if str(tgt.get("replication_transport", "ip")).lower() not in ("ip", "fc"):
+        errs.append("target_array.replication_transport must be \"ip\" or \"fc\"")
     for k in ("source_retention", "dr_retention"):
         if any(k in pg for pg in cfg.get("protection_groups") or []):
             errs.append(f"'{k}' is no longer supported - set retention on the array (purepgroup retain)")
@@ -292,21 +304,127 @@ def discover_array_name(arr):
         log.warning(f"Could not determine Purity array name; using host '{arr.host}' in log labels")
 
 
-def check_target_connected(arr, target):
-    """Warn (not fail) if the replication target is not in the source array's connected-array list."""
-    for cmd in ("purearray connection list --csv", "purearray list --connect --csv"):  # 6.x, then older
+def connected_arrays(arr):
+    """Arrays connected to `arr` for replication: {Purity name: {column: value}} from
+    purearray connection list --csv (Purity 6.x), or purearray list --connect --csv (older).
+    Returns None if neither command could be read. Read-only, so it also runs in --dry-run."""
+    for cmd in ("purearray connection list --csv", "purearray list --connect --csv"):
         try:
-            names = csv_column(arr.run(cmd), "Name")
+            out = arr.run(cmd, read_only=True)
         except CLIError:
             continue
-        if names:
-            if target in names:
-                log.info(f"Replication target {target} is connected to {arr.name}")
-            else:
-                log.warning(f"Target '{target}' not found in connected arrays {names} - "
-                            f"check target_array.name matches the Purity array name")
-            return
-    log.warning("Could not list connected arrays; skipping target check")
+        rows = list(csv.reader(io.StringIO(out)))
+        if not rows:
+            return {}
+        hdr = [h.strip().lower() for h in rows[0]]
+        if "name" not in hdr:
+            continue
+        return {r[hdr.index("name")].strip(): dict(zip(hdr, (c.strip() for c in r)))
+                for r in rows[1:] if len(r) > hdr.index("name")}
+    return None
+
+
+def check_target_connected(arr, target):
+    """Warn (not fail) if the replication target is not in the source array's connected-array list."""
+    conns = connected_arrays(arr)
+    if conns is None:
+        log.warning("Could not list connected arrays; skipping target check")
+    elif target in conns:
+        log.info(f"Replication target {target} is connected to {arr.name}")
+    else:
+        log.warning(f"Target '{target}' not found in connected arrays {sorted(conns)} - "
+                    f"check target_array.name matches the Purity array name, or run --setup to connect it")
+
+
+def parse_connection_key(out):
+    """The key from `purearray list --connection-key [--encrypted]` output:
+        Connection Key
+        Ae707eda-ca7b-872d-4c11-1d61d12ae8f2
+    Header lines are skipped; returns the last field of the first data line, or None."""
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    data = [l for l in lines if "connection key" not in l.lower()]
+    if not data:
+        return None
+    key = data[0].split()[-1].strip('"')
+    return key if len(key) >= 16 else None
+
+
+def connect_arrays(arr, tarr, tcfg):
+    """--setup step 1: connect the source array to the target for async replication, unless it already is.
+      1. On the TARGET (over SSH): purearray list --connection-key --encrypted   -> the connection key
+      2. On the SOURCE: purearray connect --encrypted --management-address <target host>
+                          --replication-transport ip --type async-replication
+         The key is typed in at the command's 'connection key' prompt (sent on stdin), so it never
+         appears in a command line, a process list or the log.
+    With "encrypted": false the key comes from purearray list --connection-key, and the connect command
+    uses --connection-key instead of --encrypted (Purity before 6.6.7).
+    Returns True if the arrays are connected (or, in --dry-run, would be)."""
+    name, host = tcfg["name"], tcfg.get("host") or tcfg["name"]
+    enc = tcfg.get("encrypted", True)
+    transport = str(tcfg.get("replication_transport", "ip")).lower()
+    conns = connected_arrays(arr)
+    if conns and name in conns:
+        row = conns[name]
+        status = row.get("status") or "listed"
+        log.info(f"{arr.name} is already connected to {name} (status: {status}), left as is")
+        if enc and str(row.get("encrypted", "")).lower() in ("false", "no", "unencrypted"):
+            log.warning(f"The connection to {name} isn't encrypted. --setup doesn't change an existing "
+                        f"connection; see 'purearray connection enable --encrypted' in the Purity docs")
+        return True
+    if conns is None:
+        log.warning("Could not list the connected arrays; trying to connect anyway")
+
+    # 1. log in to the target: check its Purity name, then read its connection key
+    try:
+        names = csv_column(tarr.run("purearray list --csv", read_only=True), "Name")
+    except CLIError as e:
+        log.error(f"Can't log in to the target array {host} as {tarr.user} ({_msg(e)}). Set up SSH key "
+                  f"login to the target too (README section 5), or connect the arrays by hand")
+        return False
+    if names and names[0] != name:
+        log.warning(f"{host} reports Purity name '{names[0]}', but target_array.name is '{name}'. The "
+                    f"connection is listed under '{names[0]}', so set target_array.name to that")
+    if arr.dry_run:
+        log.info(f"Logged in to the target {host} as {tarr.user}: OK")
+    key_cmd = "purearray list --connection-key" + (" --encrypted" if enc else "")
+    connect_cmd = (f"purearray connect{' --encrypted' if enc else ''} --management-address {shlex.quote(host)} "
+                   f"--replication-transport {transport} --type async-replication"
+                   + ("" if enc else " --connection-key"))
+    if arr.dry_run:
+        tarr.run(key_cmd)                                 # logged only: the key isn't read in a dry run
+        arr.run(connect_cmd + "   (connection key typed in at the prompt)")
+        log.info(f"Would read the {'encrypted ' if enc else ''}connection key from {name} and connect "
+                 f"{arr.name} to it ({transport}, async-replication{', encrypted' if enc else ''})")
+        return True
+    try:
+        key = parse_connection_key(tarr.run(key_cmd, secret=True))
+    except CLIError as e:
+        log.error(f"Can't read the connection key from {name}: {_msg(e)}"
+                  + (". '--encrypted' needs Purity//FA 6.6.7 or later; for older arrays set "
+                     "\"encrypted\": false in target_array" if enc else ""))
+        return False
+    if not key:
+        log.error(f"No connection key found in the output of '{key_cmd}' on {name}")
+        return False
+    log.info(f"Read the {'encrypted ' if enc else ''}connection key from {name} (not logged)")
+
+    # 2. connect from the source, answering the key prompt on stdin
+    try:
+        arr.run(connect_cmd, stdin=key + "\n")
+    except CLIError as e:
+        log.error(f"Connecting {arr.name} to {name} failed: {_msg(e)}. Check the management address "
+                  f"({host}) and the replication network ports, then run --setup again")
+        return False
+    for _ in range(6):                                   # the new connection can take a moment to show
+        conns = connected_arrays(arr) or {}
+        if name in conns:
+            log.info(f"Connected {arr.name} to {name} ({transport}, async-replication"
+                     f"{', encrypted' if enc else ''}; status: {conns[name].get('status') or 'listed'})")
+            return True
+        time.sleep(5)
+    log.error(f"'{connect_cmd}' ran, but {name} isn't in the connected arrays list yet. Check "
+              f"'purearray connection list' on {arr.name}")
+    return False
 
 
 # ----------------------------------------------------------------------------- replication progress
@@ -689,25 +807,31 @@ def _msg(e):
     return str(e).rstrip(". ")
 
 
-def setup(arr, cfg):
-    """One-time build of everything in the config on the source array, in this order:
-      1. Volumes - all of them before any protection group:
+def setup(arr, cfg, tarr=None):
+    """One-time build of everything in the config, in this order:
+      1. Array connection - connects the source array to the target for async replication if it isn't
+         already (see connect_arrays: reads the connection key from the target over SSH).
+      2. Volumes (on the source array) - all of them before any protection group:
          * a missing source volume is created with its 'size' from the config
            (purevol create --size <size> <source>)
          * a missing DR volume is created the same size as its source volume:
            purevol create --size <size> <target> when the source volume is also created by this run,
            otherwise purevol copy <source> <target> (an exact-size copy of the existing source volume)
-      2. Protection groups - each missing source and DR pgroup is created (purepgroup create <pgroup>),
+      3. Protection groups - each missing source and DR pgroup is created (purepgroup create <pgroup>),
          then its volumes are added (purepgroup setattr --addvollist v1,v2,... <pgroup>). For an existing
          pgroup, only the volumes not already in it are added. Nothing is ever removed.
-      3. Target - the replication target is added to each DR pgroup (purepgroup setattr --addtargetlist).
+         The replication target is then added to each DR pgroup (purepgroup setattr --addtargetlist);
+         skipped, and reported, if step 1 couldn't connect the arrays.
       4. Retention - shown for review, never changed.
     Safe to run again: anything that already exists is reported and left unchanged.
     With --dry-run the array is read (list commands only) so the preview shows exactly what would be
     created; nothing is changed.
-    Returns the number of protection_groups entries that are not fully set up."""
+    Returns the number of protection_groups entries that are not fully set up (all of them if the
+    arrays couldn't be connected)."""
     q = shlex.quote
     target, pgs = cfg["target_array"]["name"], cfg["protection_groups"]
+    log.info("=== setup step 1 of 4: connect the arrays ===")
+    linked = connect_arrays(arr, tarr, cfg["target_array"])
     did = lambda done, would: would if arr.dry_run else done            # log wording for --dry-run
     known = True
     try:                                                                # what is on the array now
@@ -771,8 +895,8 @@ def setup(arr, cfg):
                 else:
                     problem(pg, f"can't add {n} to {pgroup}: {_msg(e)}")
 
-    # ---- 1. every volume, source and DR, before any protection group
-    log.info("=== setup step 1 of 3: volumes ===")
+    # ---- 2. every volume, source and DR, before any protection group
+    log.info("=== setup step 2 of 4: volumes ===")
     for pg in pgs:
         for v in pg["volumes"]:
             src, tgt = v["source"], v["target"]
@@ -803,8 +927,8 @@ def setup(arr, cfg):
                 make_volume(pg, f"purevol copy {q(src)} {q(tgt)}", tgt, src_size or f"same size as {src}",
                             f" as a copy of {src}")
 
-    # ---- 2. protection groups: create, then add their volumes; DR pgroups also get the target
-    log.info("=== setup step 2 of 3: protection groups ===")
+    # ---- 3. protection groups: create, then add their volumes; DR pgroups also get the target
+    log.info("=== setup step 3 of 4: protection groups ===")
     for pg in pgs:
         vols = pg["volumes"]
         for pgroup, members, is_dr in ((pg["source_pgroup"], [v["source"] for v in vols], False),
@@ -824,7 +948,10 @@ def setup(arr, cfg):
             else:
                 log.info(f"Protection group {pgroup} already exists, adding any missing volumes")
             add_volumes(pg, pgroup, [m for m in members if m in vols_now], new)
-            if is_dr:
+            if is_dr and not linked:
+                problem(pg, f"replication target {target} not added to {pgroup}: the arrays aren't "
+                            f"connected (see step 1)")
+            elif is_dr:
                 try:
                     arr.run(f"purepgroup setattr --addtargetlist {q(target)} {q(pgroup)}")
                     log.info(f"{did('Added', 'Would add')} replication target {target} to {pgroup}")
@@ -835,8 +962,8 @@ def setup(arr, cfg):
                         problem(pg, f"can't add target {target} to {pgroup}: {_msg(e)}. Check that "
                                     f"'purearray connection list' shows {target} (target_array.name)")
 
-    # ---- 3. retention (read only; groups that would only be created by a dry run don't exist yet)
-    log.info("=== setup step 3 of 3: retention (not changed) ===")
+    # ---- 4. retention (read only; groups that would only be created by a dry run don't exist yet)
+    log.info("=== setup step 4 of 4: retention (not changed) ===")
     for pg in pgs:
         show = [n for n in (pg["source_pgroup"], pg["dr_pgroup"])
                 if n in pgs_now and (not arr.dry_run or n in pgs_before)]
@@ -869,7 +996,8 @@ def main():
                     help="show CLI commands/array output and a replication progress bar")
     ap.add_argument("--dry-run", action="store_true", help="log the commands without running them")
     ap.add_argument("--setup", action="store_true",
-                    help="one-time: create every missing volume in the config (source and DR), then the "
+                    help="one-time: connect the arrays (reads the target's connection key over SSH), "
+                         "create every missing volume in the config (source and DR), then the "
                          "source and DR pgroups, add the volumes to them, and add the replication target "
                          "to the DR pgroups (retention is not changed). With --dry-run, reads the array "
                          "and shows what would be created")
@@ -890,10 +1018,16 @@ def main():
     log.info(f"Log file: {log_path}")
     if not args.dry_run:
         discover_array_name(arr)
-        check_target_connected(arr, target)
+        if not args.setup:                       # --setup checks (and makes) the connection itself
+            check_target_connected(arr, target)
 
     if args.setup:
-        return 1 if setup(arr, cfg) else 0
+        tcfg = cfg["target_array"]               # target login: defaults to the source's user and key
+        tarr = FlashArray(tcfg.get("host") or tcfg["name"], tcfg["name"],
+                          tcfg.get("ssh_user") or src.get("ssh_user") or "pureuser",
+                          tcfg.get("ssh_key", src.get("ssh_key")) or None,
+                          s["ssh_timeout_seconds"], args.dry_run)
+        return 1 if setup(arr, cfg, tarr) else 0
 
     # Phase 1: start every protection group (snapshot, overwrite, replicate-now) without waiting
     failed, jobs = [], []

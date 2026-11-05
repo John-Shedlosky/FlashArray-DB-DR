@@ -15,26 +15,39 @@ purearray rename flasharray2
 
 
 # =============================================================================
-# 1. flasharray2: get the replication connection key
+# Steps 1 and 2 can be replaced by:
+#     python3 pg_dr_refresh.py -c pg_dr_config.json --setup
+# --setup logs in to flasharray2 over SSH, runs step 1 to read the key, then runs
+# step 2 on flasharray1 and enters the key at the prompt. The key is never logged.
+# It needs SSH key login to flasharray2 as well (README section 5, step 4).
 # =============================================================================
-purearray list --connection-key
-# -> copy the "Connection Key" value
+
+# =============================================================================
+# 1. flasharray2: get the encrypted replication connection key
+#    --encrypted needs Purity//FA 6.6.7 or later on both arrays.
+#    Older Purity: purearray list --connection-key   (and "encrypted": false in the JSON)
+# =============================================================================
+purearray list --connection-key --encrypted
+# -> copy the "Connection Key" value. It is a secret: don't save it in a file.
 
 
 # =============================================================================
-# 2. flasharray1: connect to flasharray2 for async replication
-#    Paste the key from step 1 when prompted.
+# 2. flasharray1: connect to flasharray2 for encrypted async replication over IP
+#    Paste the key from step 1 when prompted (Purity//FA 6.6.7+ asks for it; the
+#    --connection-key option is deprecated).
 #    Replace "flasharray2" with its management FQDN/VIP if the name does not resolve.
+#    Older Purity (unencrypted):
+#      purearray connect --management-address flasharray2 --replication-transport ip --type async-replication --connection-key
 # =============================================================================
-purearray connect --management-address flasharray2 --type async-replication --connection-key
-purearray list --connect
+purearray connect --encrypted --management-address flasharray2 --replication-transport ip --type async-replication
+purearray connection list
 
 
 # =============================================================================
 # 3. flasharray1: create the volumes
 #    Source volumes (members of PG1/PG2) and DR volumes (members of PG1-DR/PG2-DR).
 #    DR volumes are the same size as their source volumes.
-#    Steps 3 and 4 can be replaced by:
+#    Steps 3 and 4 are also done by --setup (after it connects the arrays):
 #        python3 pg_dr_refresh.py -c pg_dr_config.json --setup
 #    With the "size": "100G" entries in pg_dr_config.json it creates all ten volumes,
 #    then PG1, PG2, PG1-DR and PG2-DR, adds the volumes to them, and adds flasharray2
