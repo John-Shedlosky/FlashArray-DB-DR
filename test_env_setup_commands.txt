@@ -34,10 +34,11 @@ purearray list --connect
 # 3. flasharray1: create the volumes
 #    Source volumes (members of PG1/PG2) and DR volumes (members of PG1-DR/PG2-DR).
 #    DR volumes are the same size as their source volumes.
-#    Instead of the DR volume line below and the DR protection group lines in step 4,
-#    you can run:  python3 pg_dr_refresh.py -c pg_dr_config.json --setup
-#    It creates each DR volume as a copy of its source volume, then the DR protection
-#    groups, and adds flasharray2 as the target.
+#    Steps 3 and 4 can be replaced by:
+#        python3 pg_dr_refresh.py -c pg_dr_config.json --setup
+#    With the "size": "100G" entries in pg_dr_config.json it creates all ten volumes,
+#    then PG1, PG2, PG1-DR and PG2-DR, adds the volumes to them, and adds flasharray2
+#    as the target of PG1-DR and PG2-DR. Run it with --dry-run first to preview.
 # =============================================================================
 purevol create --size 100G vol-data-01 vol-data-02 vol-log-01 sql-db sql-log
 purevol create --size 100G vol-data-01-dr vol-data-02-dr vol-log-01-dr sql-db-dr sql-log-dr

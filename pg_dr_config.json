@@ -62,29 +62,37 @@
   // Processed in order. For each entry: snapshot source_pgroup, overwrite every
   // "target" volume from its "source" volume in that snapshot, then snapshot
   // dr_pgroup and replicate it to target_array.
+  // --setup builds everything listed here on the source array: first every missing
+  // volume (source and target), then source_pgroup and dr_pgroup, adding the volumes
+  // to them, then target_array on dr_pgroup. Nothing that already exists is changed.
   "protection_groups": [
     {
-      // Existing protection group on the source array to snapshot.
+      // Protection group on the source array to snapshot. --setup creates it if
+      // missing and adds the "source" volumes below to it.
       "source_pgroup": "PG1",
 
       // Protection group containing the target volumes; snapshotted and replicated.
-      // Must already exist with target_array added (or create it with --setup).
+      // --setup creates it if missing and adds the "target" volumes and target_array to it.
       "dr_pgroup": "PG1-DR",
 
-      // target = existing volume that gets overwritten (member of dr_pgroup).
+      // target = volume that gets overwritten (member of dr_pgroup).
       // source = volume in source_pgroup whose snapshot overwrites it.
+      // size   = optional, used only by --setup: the size of a source volume it has to
+      //          create (whole number + K, M, G, T or P, e.g. "100G", "2T"). The target
+      //          volume is always made the same size as its source volume. If the source
+      //          volume already exists, size is ignored and can be left out.
       "volumes": [
-        { "target": "vol-data-01-dr", "source": "vol-data-01" },
-        { "target": "vol-data-02-dr", "source": "vol-data-02" },
-        { "target": "vol-log-01-dr",  "source": "vol-log-01"  }
+        { "target": "vol-data-01-dr", "source": "vol-data-01", "size": "100G" },
+        { "target": "vol-data-02-dr", "source": "vol-data-02", "size": "100G" },
+        { "target": "vol-log-01-dr",  "source": "vol-log-01",  "size": "100G" }
       ]
     },
     {
       "source_pgroup": "PG2",
       "dr_pgroup":     "PG2-DR",
       "volumes": [
-        { "target": "sql-db-dr",  "source": "sql-db"  },
-        { "target": "sql-log-dr", "source": "sql-log" }
+        { "target": "sql-db-dr",  "source": "sql-db",  "size": "100G" },
+        { "target": "sql-log-dr", "source": "sql-log", "size": "100G" }
       ]
     }
   ]
