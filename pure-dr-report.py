@@ -76,6 +76,9 @@ Usage
   pure-dr-report.py                          # logs from <script folder>/logs/
   pure-dr-report.py -c pg_dr_config.json     # logs from the config's log_file location
   pure-dr-report.py -l /var/log/pure         # a folder, file(s), or glob(s)
+  pure-dr-report.py --remote                 # e.g. on Windows: read the logs on the Linux server over SSH;
+                                             # asks for the hostname, username and password
+  pure-dr-report.py --remote -l /var/log/pure   # with --remote, -l and -c are paths on that server
   pure-dr-report.py --period prev-month      # last7 | last30 | prev-week | prev-month | this-month | all
   pure-dr-report.py --from 2026-09-01 --to 2026-09-30   # custom date range (inclusive)
   pure-dr-report.py --days 14 --pgroup PG1   # rolling last N days / one protection group
@@ -93,9 +96,11 @@ Python 3.8+. --cli, --no-gui and CSV output need nothing else. The window and PN
 (distro package python3-matplotlib, or pip inside a virtual environment); the window also needs Tk
 (Linux: python3-tk / python3-tkinter / python3.11-tkinter / python311-tk; included with the python.org
 Windows and macOS installers) and a display (desktop session or ssh -X). See README.md for each distro.
+--remote also needs paramiko: py -m pip install paramiko (Windows) - see README.md.
 """
-import argparse, collections, csv, datetime, glob, json, os, re, statistics, sys
-from pathlib import Path
+import argparse, base64, collections, csv, datetime, fnmatch, getpass, glob, hashlib, io, json, os
+import posixpath, re, shlex, stat, statistics, sys
+from pathlib import Path, PurePosixPath
 
 if sys.version_info < (3, 8):
     sys.exit("pure-dr-report.py needs Python 3.8 or newer (found %d.%d)" % sys.version_info[:2])
@@ -203,6 +208,15 @@ def mean(xs):
 
 
 # ============================================================================ log discovery
+def config_log_file(text):
+    """The log_file setting from the text of a pg_dr_refresh JSON config (comments allowed); None if unset."""
+    text = re.sub(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/', lambda m: m.group(1) or "", text, flags=re.S)
+    return json.loads(text).get("log_file")
+
+def weekly_glob(base):
+    """log_file -> the weekly files pg_dr_refresh.py writes: .../pg_dr_refresh.log -> .../pg_dr_refresh_*.log"""
+    return str(base.with_name(f"{base.stem}_*{base.suffix or '.log'}"))
+
 def find_logs(paths, config):
     """Resolve -l paths/globs, else the config's log_file location, else the default folder."""
     pats = []
@@ -213,9 +227,7 @@ def find_logs(paths, config):
     elif config:
         base = None
         try:
-            text = Path(config).read_text(encoding="utf-8")
-            text = re.sub(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/', lambda m: m.group(1) or "", text, flags=re.S)
-            base = json.loads(text).get("log_file")
+            base = config_log_file(Path(config).read_text(encoding="utf-8"))
         except (OSError, ValueError) as e:
             sys.exit(f"Cannot read config {config}: {e}")
         if base:                                    # relative paths are relative to the config file's folder
@@ -224,7 +236,7 @@ def find_logs(paths, config):
                 base = Path(config).resolve().parent / base
         else:
             base = SCRIPT_DIR / "logs" / "pg_dr_refresh.log"
-        pats.append(str(base.with_name(f"{base.stem}_*{base.suffix or '.log'}")))
+        pats.append(weekly_glob(base))
     else:
         pats.append(str(DEFAULT_LOG_GLOB))
     files = sorted({f for pat in pats for f in glob.glob(pat) if os.path.isfile(f)})
@@ -242,11 +254,12 @@ def split_snap(name):
     parts = name.split(".")
     return (parts[0], parts[1], ".".join(parts[2:]) or None) if len(parts) >= 2 else (name, None, None)
 
-def load_records(files):
-    """Return a de-duplicated list of pgroup and volume records from all log files."""
+def load_records(files, opener=None):
+    """Return a de-duplicated list of pgroup and volume records from all log files.
+    opener(path) gives one file as a text stream (RemoteLogs.open for --remote); default: open it here."""
     recs, legacy, have_drdata = {}, [], set()
     for f in files:
-        with open(f, encoding="utf-8", errors="replace") as fh:
+        with (opener(f) if opener else open(f, encoding="utf-8", errors="replace")) as fh:
             for line in fh:
                 m = DR_RE.search(line)
                 if m:
@@ -280,6 +293,297 @@ def load_records(files):
         if r["run"] and r["run"] not in have_drdata:
             recs.setdefault((r["type"], r["run"], r["dr_pgroup"], r["volume"]), r)
     return [r for r in recs.values() if r.get("time")]
+
+
+# ============================================================================ remote logs (--remote)
+REMOTE_LOGS = "/var/log/pure/pg_dr_refresh_*.log"        # default: the log_file of the sample config
+KNOWN_HOSTS = Path(os.path.expanduser("~")) / ".ssh" / "known_hosts"   # Windows: C:\Users\<you>\.ssh\known_hosts
+
+
+class RemoteError(Exception):
+    """A --remote problem, with a message for the user."""
+
+
+class Cancelled(Exception):
+    """The password dialog was cancelled."""
+
+
+def ask(prompt, default=""):
+    """One answer typed in the console. The prompt goes to stderr, so it is seen even when the report
+    itself is redirected (--cli > report.txt)."""
+    sys.stderr.write(prompt + (f" [{default}]" if default else "") + ": ")
+    sys.stderr.flush()
+    return input().strip() or default
+
+
+def ask_yes_no(question):
+    while True:
+        a = ask(question + " (yes/no)").lower()
+        if a in ("yes", "y", "no", "n"):
+            return a.startswith("y")
+
+
+def split_host(text):
+    """'server' -> ('server', 22); 'server:2222' or '[fe80::1]:2222' -> that port."""
+    m = re.fullmatch(r"\[([^\]]+)\](?::(\d+))?|([^:\s]+):(\d+)", text)
+    host, port = ((m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))) if m else (text, None)
+    if port is not None and not 0 < int(port) < 65536:
+        raise RemoteError(f"invalid port in '{text}'")
+    return host, int(port or 22)
+
+
+def default_user():
+    try:
+        return getpass.getuser()
+    except Exception:
+        return ""
+
+
+def import_paramiko():
+    """paramiko (SSH for Python), or an install hint."""
+    try:
+        import paramiko
+    except ImportError:
+        raise RemoteError("--remote needs the paramiko package. Install it with:\n"
+                          "    py -m pip install paramiko         (Windows)\n"
+                          "    python3 -m pip install paramiko    (Linux, in a virtual environment)") from None
+    import logging
+    logging.getLogger("paramiko").setLevel(logging.CRITICAL)        # errors are reported by this script
+    return paramiko
+
+
+def fingerprint(key):
+    """A host key's SHA256 fingerprint, as ssh and ssh-keygen -l show it."""
+    return "SHA256:" + base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
+
+
+def save_host_key(hostname, key):
+    """Add an accepted host key to known_hosts (the file Windows' own ssh.exe uses too)."""
+    try:
+        KNOWN_HOSTS.parent.mkdir(parents=True, exist_ok=True)
+        lead = ""
+        if KNOWN_HOSTS.exists() and KNOWN_HOSTS.stat().st_size:
+            with open(KNOWN_HOSTS, "rb") as f:
+                f.seek(-1, os.SEEK_END)
+                lead = "" if f.read(1) == b"\n" else "\n"
+        with open(KNOWN_HOSTS, "a", encoding="ascii", newline="\n") as f:
+            f.write(f"{lead}{hostname} {key.get_name()} {key.get_base64()}\n")
+        return f"Added {hostname} to {KNOWN_HOSTS}"
+    except OSError as e:
+        return f"Warning: couldn't save the host key to {KNOWN_HOSTS} ({e}); you'll be asked again next time"
+
+
+class RemoteLogs:
+    """The pg_dr_refresh logs on a Linux server, read over SSH (SFTP) after a username + password login.
+    SSH keys and agents are never used. Each file is read into memory: nothing is copied to this
+    computer. The password isn't kept: if the connection drops, Reload asks for it again.
+    ask_password / confirm / tell prompt in the console; the window replaces them with dialog boxes."""
+
+    def __init__(self, host, port, user):
+        self.pm = import_paramiko()
+        self.host, self.port, self.user = host, port, user
+        self.client = self.sftp = None
+        self.home, self.patterns = "/", []
+        self.ask_password = lambda: getpass.getpass(f"Password for {self.label}: ", stream=sys.stderr)
+        self.confirm = ask_yes_no
+        self.tell = lambda msg: print(msg, file=sys.stderr)
+
+    @property
+    def label(self):
+        return f"{self.user}@{self.host}" + (f":{self.port}" if self.port != 22 else "")
+
+    def connect(self, tries=3):
+        """Log in, asking for the password on each try. Raises RemoteError if it can't."""
+        pm, where = self.pm, f"{self.host}:{self.port}"
+        for attempt in range(1, tries + 1):
+            password = self.ask_password()
+            if password is None:
+                raise Cancelled()
+            client = pm.SSHClient()
+            try:
+                client.load_system_host_keys()                     # ~/.ssh/known_hosts, if there is one
+            except Exception as e:
+                self.tell(f"Warning: couldn't read {KNOWN_HOSTS} ({e})")
+            client.set_missing_host_key_policy(self._ask_host_key())
+            try:
+                client.connect(self.host, port=self.port, username=self.user, password=password,
+                               allow_agent=False, look_for_keys=False,           # password only, no SSH keys
+                               timeout=20, banner_timeout=30, auth_timeout=30)
+            except pm.AuthenticationException as e:
+                client.close()
+                allowed = getattr(e, "allowed_types", None)              # set if the method isn't allowed
+                if allowed is not None and not {"password", "keyboard-interactive"} & set(allowed):
+                    raise RemoteError(f"{self.host} doesn't allow password logins (it allows: "
+                                      f"{', '.join(allowed) or 'none'}). Its administrator can allow them "
+                                      f"with 'PasswordAuthentication yes' in /etc/ssh/sshd_config") from None
+                self.tell(f"Wrong username or password for {self.label}" + (" - try again" if attempt < tries else ""))
+                continue
+            except pm.BadHostKeyException as e:
+                client.close()
+                raise RemoteError(
+                    f"the host key of {self.host} has CHANGED (it is now {fingerprint(e.key)}). Someone may be "
+                    f"intercepting the connection, or the server was reinstalled, so the password wasn't sent. "
+                    f"If the server's administrator confirms the new key, remove the old one with "
+                    f"'ssh-keygen -R {self.host}' (or delete its line in {KNOWN_HOSTS}) and connect again") from None
+            except (RemoteError, Cancelled):                     # host key not accepted
+                client.close()
+                raise
+            except pm.SSHException as e:
+                client.close()
+                raise RemoteError(f"SSH to {where} failed: {e}") from None
+            except OSError as e:                                 # unknown name, refused, unreachable, timeout
+                client.close()
+                raise RemoteError(f"can't connect to {where}: {e.strerror or str(e) or type(e).__name__}. "
+                                  f"Check the hostname, and that this computer can reach the server on "
+                                  f"port {self.port}") from None
+            finally:
+                password = None                                  # not kept
+            try:
+                client.get_transport().set_keepalive(30)         # keeps the connection open while the window is
+                self.sftp = client.open_sftp()
+                self.home = self.sftp.normalize(".")
+            except (pm.SSHException, OSError, EOFError) as e:
+                client.close()
+                raise RemoteError(f"logged in to {self.label}, but it doesn't allow SFTP ({e or type(e).__name__}). "
+                                  f"Its administrator can enable 'Subsystem sftp' in /etc/ssh/sshd_config") from None
+            self.client = client
+            return
+        raise RemoteError(f"login to {self.label} failed {tries} times")
+
+    def _ask_host_key(self):
+        """paramiko policy for a server that isn't in known_hosts: show its fingerprint, as ssh does, and
+        ask. The password is only sent after the key is accepted."""
+        remote = self
+
+        class AskUser(self.pm.MissingHostKeyPolicy):
+            def missing_host_key(self, client, hostname, key):
+                kt = key.get_name()
+                kt = "ed25519" if "ed25519" in kt else "ecdsa" if "ecdsa" in kt else "rsa"
+                if not remote.confirm(
+                        f"The authenticity of host '{hostname}' can't be established.\n"
+                        f"{key.get_name()} key fingerprint is {fingerprint(key)}.\n"
+                        f"(On the server, 'ssh-keygen -lf /etc/ssh/ssh_host_{kt}_key.pub' shows its fingerprint.)\n"
+                        f"Are you sure you want to continue connecting"):
+                    raise RemoteError(f"the host key of {hostname} wasn't accepted, so nothing was sent to it")
+                client.get_host_keys().add(hostname, key.get_name(), key)
+                remote.tell(save_host_key(hostname, key))
+        return AskUser()
+
+    def ensure_connected(self):
+        """Log in again (asks for the password) if the connection dropped, e.g. the server restarted."""
+        t = self.client.get_transport() if self.client else None
+        if t is None or not t.is_active():
+            self.close()
+            self.connect()
+
+    def close(self):
+        if self.client:
+            self.client.close()
+        self.client = self.sftp = None
+
+    # ---- paths on the server: always '/' paths, also when this script runs on Windows
+    def path(self, p):
+        """A path on the server. ~ and relative paths start in the login's home folder."""
+        if re.match(r"[A-Za-z]:[\\/]", p) or "\\" in p:
+            raise RemoteError(f"'{p}' is a Windows path. With --remote, -l and -c are paths on the server, "
+                              f"e.g. -l /var/log/pure. (Git Bash changes /var/... to C:/Program Files/Git/var/...: "
+                              f"use PowerShell or Command Prompt, or set MSYS_NO_PATHCONV=1.)")
+        if p == "~" or p.startswith("~/"):
+            p = self.home + p[1:]
+        return posixpath.normpath(posixpath.join(self.home, p))
+
+    def kind(self, p, attr=None):
+        """'file', 'dir' or None (missing, or no access), following symbolic links."""
+        try:
+            if attr is None or stat.S_ISLNK(attr.st_mode or 0):
+                attr = self.sftp.stat(p)
+        except OSError:
+            return None
+        m = attr.st_mode or 0
+        return "file" if stat.S_ISREG(m) else "dir" if stat.S_ISDIR(m) else None
+
+    def glob(self, pattern):
+        """The files matching a path on the server, with * ? [...] wildcards in the file name."""
+        folder, name = posixpath.split(pattern)
+        if glob.has_magic(folder):
+            raise RemoteError(f"{pattern}: on the server, wildcards work in the file name only")
+        if not glob.has_magic(name):
+            return [pattern] if self.kind(pattern) == "file" else []
+        try:
+            entries = self.sftp.listdir_attr(folder)
+        except OSError as e:
+            raise RemoteError(f"can't list {folder} on {self.host}: {e.strerror or e}") from None
+        return [posixpath.join(folder, e.filename) for e in entries
+                if fnmatch.fnmatchcase(e.filename, name) and not e.filename.startswith(".")
+                and self.kind(posixpath.join(folder, e.filename), e) == "file"]
+
+    def find(self, paths, config):
+        """The log files on the server: -l folders / files / globs; else the log_file of the config at -c
+        (a path on the server); else /var/log/pure/pg_dr_refresh_*.log. Returns (files, patterns)."""
+        if paths:
+            pats = []
+            for p in paths:
+                p = self.path(p)
+                pats.append(posixpath.join(p, "*.log") if self.kind(p) == "dir" else p)
+        elif config:
+            cfg = self.path(config)
+            try:
+                base = config_log_file(self.read(cfg)) or "logs/pg_dr_refresh.log"   # pg_dr_refresh.py's default
+            except (OSError, ValueError) as e:
+                raise RemoteError(f"can't read the config {cfg} on {self.host}: "
+                                  f"{getattr(e, 'strerror', None) or e}") from None
+            if not base.startswith(("/", "~")):                      # relative: from the config's folder
+                base = posixpath.join(posixpath.dirname(cfg), base)
+            pats = [weekly_glob(PurePosixPath(self.path(base)))]
+        else:
+            pats = [REMOTE_LOGS]
+        return self.search(pats)
+
+    def search(self, pats):
+        """Search the patterns (again for Reload, so a new week's log file is included)."""
+        files = sorted({f for pat in pats for f in self.glob(pat)})
+        self.patterns = pats
+        return files, pats
+
+    def read(self, p):
+        """A file's text, read into memory over SFTP. Nothing is written to this computer."""
+        with self.sftp.open(p, "rb") as fh:
+            try:
+                fh.prefetch(max_concurrent_requests=64)          # paramiko 3.3+ (64 = OpenSSH's own limit)
+            except TypeError:
+                fh.prefetch()                                    # older paramiko
+            return fh.read().decode("utf-8", errors="replace")
+
+    def open(self, p):
+        """load_records' opener: one log file as a text stream."""
+        try:
+            return io.StringIO(self.read(p))
+        except OSError as e:
+            raise RemoteError(f"can't read {p} on {self.host}: {e.strerror or e}") from None
+
+    def load(self, files):
+        return load_records(files, self.open)
+
+
+def open_remote():
+    """--remote: ask for the server, username and password in the console, then log in (exits on failure)."""
+    if not (sys.stdin and sys.stdin is sys.__stdin__ and sys.stdin.isatty()):
+        sys.exit("--remote asks for a password, so run it in a Command Prompt or PowerShell window "
+                 "(not in IDLE, with pythonw, or with its input redirected)")
+    try:
+        import_paramiko()                                    # first, so no password is typed in vain
+        host = ""
+        while not host:
+            host = ask("Hostname of the Linux server with the logs")
+        host, port = split_host(host)
+        remote = RemoteLogs(host, port, ask("Username", default_user()))
+        remote.connect()
+        return remote
+    except (KeyboardInterrupt, EOFError):
+        print(file=sys.stderr)
+        sys.exit("Cancelled")
+    except RemoteError as e:
+        sys.exit(f"--remote: {e}")
 
 
 # ============================================================================ model
@@ -1458,9 +1762,10 @@ def export_png(report, period, outdir, pg_filter=None):
 
 
 # ============================================================================ GUI (tkinter)
-def run_gui(args, files, report, period_key, custom):
+def run_gui(args, files, report, period_key, custom, remote=None):
     """Open the Tk window: period picker, protection-group filter, Overview tree, chart tabs and the
-    Weekly / Monthly tab. All tabs follow the selected period and protection group."""
+    Weekly / Monthly tab. All tabs follow the selected period and protection group.
+    remote = the logged-in RemoteLogs (--remote): Reload and Open logs... then read from that server."""
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
     import matplotlib; matplotlib.use("TkAgg")
@@ -1468,7 +1773,14 @@ def run_gui(args, files, report, period_key, custom):
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
     root = tk.Tk()
-    root.title("Pure DR Replication Report")
+    root.title("Pure DR Replication Report" + (f" - {remote.label}" if remote else ""))
+    if remote:                              # if Reload must log in again: dialog boxes, not the console
+        from tkinter import simpledialog
+        remote.ask_password = lambda: simpledialog.askstring(
+            "Log in again", f"The connection to {remote.host} was closed.\nPassword for {remote.label}:",
+            show="*", parent=root)
+        remote.confirm = lambda msg: messagebox.askyesno("Unknown host key", msg + "?", parent=root)
+        remote.tell = lambda msg: messagebox.showinfo("Remote logs", msg, parent=root)
     root.geometry("1420x860")
     state = {"files": files, "report": report, "model": None, "period": None}
 
@@ -1477,7 +1789,7 @@ def run_gui(args, files, report, period_key, custom):
     info = ttk.Label(top, font=("TkDefaultFont", 10)); info.pack(side="left")
     ttk.Button(top, text="Export PNGs...", command=lambda: do_export()).pack(side="right", padx=4)
     ttk.Button(top, text="Export CSV...", command=lambda: do_export_csv()).pack(side="right", padx=4)
-    ttk.Button(top, text="Reload", command=lambda: reload(state["files"])).pack(side="right", padx=4)
+    ttk.Button(top, text="Reload", command=lambda: reload()).pack(side="right", padx=4)
     ttk.Button(top, text="Open logs...", command=lambda: open_logs()).pack(side="right", padx=4)
 
     # ---- row 2: period picker (+ custom range) and protection group
@@ -1630,7 +1942,7 @@ def run_gui(args, files, report, period_key, custom):
         rep, per = state["report"], state["period"]
         m = state["model"] = rep.model_for(per)
         sel = pg_var.get()
-        info.config(text=(f"{len(state['files'])} log file(s)   "
+        info.config(text=((f"{remote.label}:  " if remote else "") + f"{len(state['files'])} log file(s)   "
                           + (f"logs {rep.first:%Y-%m-%d} .. {rep.last:%Y-%m-%d}   "
                              f"{len(rep.all_model.pgroups)} protection group(s), "
                              f"{sum(len(p['volumes']) for p in rep.all_model.pgroups.values())} volume(s)"
@@ -1654,14 +1966,53 @@ def run_gui(args, files, report, period_key, custom):
             fn(m, fig, sel); canvas.draw_idle()
         refresh_wm()
 
-    def reload(new_files):
-        """Re-read log files (Reload / Open logs...) and refresh."""
+    def reload(new_files=None):
+        """Reload: read the logs again (--remote: search the server again, so a new week's file is
+        included). Open logs...: read the files picked."""
+        try:
+            if remote:
+                remote.ensure_connected()
+                if new_files is None:
+                    new_files, pats = remote.search(remote.patterns)
+                    if not new_files:
+                        raise RemoteError(f"no log files found in {', '.join(pats)}")
+                root.config(cursor="watch"); root.update_idletasks()
+                try:
+                    records = remote.load(new_files)
+                finally:
+                    root.config(cursor="")
+            else:
+                new_files = state["files"] if new_files is None else new_files
+                records = load_records(new_files)
+        except Cancelled:
+            return
+        except RemoteError as e:
+            messagebox.showerror("Remote logs", f"{e}\n\nStill showing the logs read before.", parent=root)
+            return
         state["files"] = new_files
-        state["report"] = Report(load_records(new_files), args.as_of)
+        state["report"] = Report(records, args.as_of)
         refresh()
 
     def open_logs():
-        """Pick log files to load instead of the configured folder."""
+        """Pick log files to load instead of the configured folder (--remote: a path on the server)."""
+        if remote:
+            from tkinter import simpledialog
+            p = simpledialog.askstring("Open logs", f"Log folder, file or glob on {remote.label}:",
+                                       initialvalue=" ".join(remote.patterns), parent=root)
+            if not p or not p.strip():
+                return
+            try:
+                remote.ensure_connected()
+                found, pats = remote.find(shlex.split(p), None)
+                if not found:
+                    raise RemoteError(f"no log files found in {', '.join(pats)}")
+            except Cancelled:
+                return
+            except (RemoteError, ValueError) as e:
+                messagebox.showerror("Remote logs", str(e), parent=root)
+                return
+            reload(found)
+            return
         picked = filedialog.askopenfilenames(title="Select pg_dr_refresh log files",
                                              filetypes=[("Log files", "*.log"), ("All files", "*")])
         if picked:
@@ -1697,6 +2048,11 @@ def main():
     ap = argparse.ArgumentParser(description="Graphical report of pg_dr_refresh.py log files")
     ap.add_argument("-c", "--config", help="pg_dr_refresh JSON config (uses its log_file location)")
     ap.add_argument("-l", "--logs", nargs="+", help="log file(s), folder(s) or glob(s)")
+    ap.add_argument("--remote", action="store_true",
+                    help="read the logs on a Linux server over SSH (SFTP), e.g. from a Windows PC. Asks for "
+                         "the hostname, username and password (not shown as you type); no SSH keys needed. "
+                         "-l and -c are then paths on that server (default: /var/log/pure/pg_dr_refresh_*.log). "
+                         "Needs paramiko: py -m pip install paramiko")
     ap.add_argument("--period", choices=[k for k in PERIODS if k != "custom"],
                     help="last7 | last30 | prev-week (Mon-Sun) | prev-month | this-month | all (default)")
     ap.add_argument("--from", dest="date_from", type=parse_date, metavar="YYYY-MM-DD",
@@ -1733,10 +2089,33 @@ def main():
         ap.error("--days must be 1 or more")
     period_key = ("custom" if chosen[1] else f"last{args.days}" if args.days else args.period or "all")
 
-    files, pats = find_logs(args.logs, args.config)
-    if not files:
-        sys.exit("No log files found in: " + ", ".join(pats))
-    report = Report(load_records(files), args.as_of)
+    remote = open_remote() if args.remote else None
+    try:
+        show_report(args, period_key, remote)
+    finally:
+        if remote:
+            remote.close()
+
+
+def show_report(args, period_key, remote=None):
+    """Find and read the logs (on this computer, or on the --remote server), then export / print / open
+    the window."""
+    if remote:
+        try:
+            files, pats = remote.find(args.logs, args.config)
+            if not files:
+                raise RemoteError(f"no log files found on {remote.label} in: {', '.join(pats)}. "
+                                  f"Give the log folder on the server with -l, e.g. -l /var/log/pure")
+            print(f"Reading {len(files)} log file(s) from {remote.label}...", file=sys.stderr)
+            records = remote.load(files)
+        except RemoteError as e:
+            sys.exit(f"--remote: {e}")
+    else:
+        files, pats = find_logs(args.logs, args.config)
+        if not files:
+            sys.exit("No log files found in: " + ", ".join(pats))
+        records = load_records(files)
+    report = Report(records, args.as_of)
     period = report.period(period_key, args.date_from, args.date_to)
 
     if args.export_csv:
@@ -1771,7 +2150,7 @@ def main():
         print(text_report(report, period, args.pgroup, args.summary))
         return
     try:
-        run_gui(args, files, report, period_key, (args.date_from, args.date_to))
+        run_gui(args, files, report, period_key, (args.date_from, args.date_to), remote)
     except tkinter.TclError as e:                                  # e.g. display refused the connection
         print(f"Cannot open the window ({e}). Showing text report instead.\n")
         print(text_report(report, period, args.pgroup, args.summary))
