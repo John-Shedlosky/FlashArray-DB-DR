@@ -32,8 +32,8 @@ ls /opt/pure-dr
 
  pureadmin setattr --publickey
 
-ssh -i ~/.ssh/id_rsa_pure jjones@flasharray1
-ssh -i ~/.ssh/id_rsa_pure jjones@flasharray2
+ssh -i ~/.ssh/id_rsa_pure jjones@flasharray1.testdrive.local
+ssh -i ~/.ssh/id_rsa_pure jjones@flasharray2.testdrive.local
 
 cd /opt/pure-dr/
 
