@@ -68,6 +68,14 @@
   // pure-dr-report.py -c <this file> reads its logs from the same place.
   "log_file": "/var/log/pure/pg_dr_refresh.log",
 
+  // ----------------------------------------------------------- state file --
+  // Optional. Where --snaponly (-S) records the snapshots it took, for the
+  // --cloneandreplicate (-C) run that follows. Written by the script - don't edit it.
+  // A relative path is taken relative to the folder this config file is in.
+  // If omitted, defaults to <config name>.state.json next to this file
+  // (e.g. pg_dr_config.state.json). Not used by normal runs or --setup.
+  // "state_file": "pg_dr_config.state.json",
+
   // ------------------------------------------------------------- settings --
   "settings": {
     // Start of every snapshot suffix the script creates; the full suffix is

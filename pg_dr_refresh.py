@@ -51,20 +51,49 @@ Configuration
 -------------
 JSON with optional // and /* */ comments - see pg_dr_config.json for every setting.
 
+Split runs: --snaponly (-S) then --cloneandreplicate (-C)
+--------------------------------------------------------
+A normal run does steps 0-6 in one go. To keep the time a database spends in backup mode as short as
+possible, the work can be split in two:
+
+  -S / --snaponly           Step 1 only: snapshot every source pgroup, back to back, on the source array.
+                            Nothing else is checked or contacted (not the target array, not the DR
+                            volumes), so the database can leave backup mode as soon as this returns.
+                            The snapshots taken are recorded in a small state file (see below).
+  -C / --cloneandreplicate  Steps 0 and 2-6, using the snapshots recorded by the last --snaponly run:
+                            check the DR volumes, check each recorded snapshot still exists and holds
+                            every source volume, overwrite the DR volumes, snapshot + replicate the
+                            DR pgroups and monitor them on the target.
+
+-C fails (exit code 2, nothing changed) if --snaponly hasn't recorded any snapshots, or if they have
+all been used by an earlier -C already: run -S again first. If a pgroup fails in -C before any of its
+DR volumes were overwritten (e.g. a DR volume is missing), it stays unused in the state file and the
+next -C retries just that pgroup with the same snapshot.
+
+The DR snapshots made by -C use the same suffix as the -S snapshots (e.g. PG1.dr-20261109-020000 and
+PG1-DR.dr-20261109-020000), so names still show the point in time the data is from.
+
+State file: "state_file" in the config, or by default <config name>.state.json next to the config
+(pg_dr_config.json -> pg_dr_config.state.json). It is written by the script; don't edit it. The config
+itself is never written to, so its comments stay intact.
+
 Usage
 -----
-  pg_dr_refresh.py -c pg_dr_config.json            # normal run
+  pg_dr_refresh.py -c pg_dr_config.json            # normal run (snapshot, overwrite, replicate)
   pg_dr_refresh.py -c pg_dr_config.json -V         # verbose: commands, array output, progress bars
   pg_dr_refresh.py -c pg_dr_config.json --dry-run  # log the commands that would run; change nothing
   pg_dr_refresh.py -c pg_dr_config.json --setup    # one-time: connect the arrays, create the volumes,
                                                    # then the pgroups + target
+  pg_dr_refresh.py -c pg_dr_config.json -S         # snapshots only (database in backup mode)
+  pg_dr_refresh.py -c pg_dr_config.json -C         # then: overwrite + replicate from those snapshots
 
-Exit code: 0 = every pgroup succeeded, 1 = at least one pgroup failed, 2 = config / usage error.
+Exit code: 0 = every pgroup succeeded, 1 = at least one pgroup failed, 2 = config / usage error
+(including -C with no unused --snaponly snapshots).
 
 Requirements: Python 3.8+ and an OpenSSH client ('ssh' on the PATH) with key-based login to the
 source array. No extra Python packages are needed.
 """
-import argparse, csv, datetime, io, json, logging, re, shlex, subprocess, sys, time
+import argparse, csv, datetime, io, json, logging, os, re, shlex, subprocess, sys, time
 from pathlib import Path
 
 if sys.version_info < (3, 8):
@@ -220,6 +249,51 @@ def resolve_log_base(cfg, config_path):
     return base if base.is_absolute() else Path(config_path).resolve().parent / base
 
 
+def resolve_state_path(cfg, config_path):
+    """Where --snaponly records its snapshots for --cloneandreplicate: state_file from the config
+    (relative to the config's folder), else <config stem>.state.json next to the config."""
+    base = cfg.get("state_file")
+    cdir = Path(config_path).resolve().parent
+    if not base:
+        return cdir / f"{Path(config_path).stem}.state.json"
+    base = Path(base).expanduser()
+    return base if base.is_absolute() else cdir / base
+
+
+def read_state(path):
+    """The --snaponly state as a dict, or None if there is no state file.
+    Raises ValueError if the file exists but can't be read or parsed."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            st = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValueError(f"can't read the state file {path}: {e}")
+    if not isinstance(st, dict) or not isinstance(st.get("snapshots"), list) or not st.get("suffix"):
+        raise ValueError(f"the state file {path} isn't one written by pg_dr_refresh.py --snaponly")
+    return st
+
+
+def write_state(path, st):
+    """Write the state file atomically (temp file + rename), so an interrupted write never leaves a
+    half-written file behind."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def unused_snapshots(st, pgroups=None):
+    """State entries -C still has to process: snapshot taken OK and not yet used by a -C run.
+    pgroups = source pgroup names still in the config (entries for others are ignored)."""
+    return [e for e in st["snapshots"] if e.get("status") == "ok" and not e.get("cloned")
+            and (pgroups is None or e.get("source_pgroup") in pgroups)]
+
+
 def load_config(path):
     """Read and validate the JSON config. Returns (config dict, settings with defaults filled in).
     Exits with a list of every problem found, so all mistakes can be fixed in one pass."""
@@ -257,6 +331,8 @@ def load_config(path):
     for k in ("source_retention", "dr_retention"):
         if any(k in pg for pg in cfg.get("protection_groups") or []):
             errs.append(f"'{k}' is no longer supported - set retention on the array (purepgroup retain)")
+    if "state_file" in cfg and not (cfg["state_file"] is None or isinstance(cfg["state_file"], str)):
+        errs.append("state_file must be a file path (text) or null")
     if not PREFIX_RE.match(str(settings["snapshot_prefix"])):
         errs.append("settings.snapshot_prefix may contain only letters, digits and dashes")
     pgs = cfg.get("protection_groups") or []
@@ -658,30 +734,72 @@ def snap_names(output):
     return {l.split()[0].strip('"').split(",")[0] for l in output.splitlines() if l.strip()}
 
 
-def start_pgroup(arr, pg, target, suffix, run_time, dry_run):
-    """Phase 1 for one pgroup: check DR volumes, snapshot, verify, overwrite, snapshot + start replication.
-    Returns a 'job' dict that monitor_all() polls; does NOT wait for the transfer.
-    Raises CLIError if any step fails; steps after the failure are not run for this pgroup."""
-    src_pg, dr_pg, vols = pg["source_pgroup"], pg["dr_pgroup"], pg["volumes"]
-    q = shlex.quote
-    log.info(f"=== {src_pg} -> {dr_pg} -> {target}  (suffix {suffix}) ===")
+def check_dr_volumes(arr, vols):
+    """Step 0: every DR volume to be overwritten must already exist. Returns {DR volume: size}.
+    Raises CLIError (from purevol list) if one doesn't exist."""
+    out = arr.run("purevol list --csv " + " ".join(shlex.quote(v["target"]) for v in vols))
+    return dict(zip(csv_column(out, "Name"), csv_column(out, "Size")))
 
-    # 0. Pre-check: every DR volume to be overwritten must already exist (also records sizes)
-    out = arr.run("purevol list --csv " + " ".join(q(v["target"]) for v in vols))
-    sizes = dict(zip(csv_column(out, "Name"), csv_column(out, "Size")))
 
-    # 1. Snapshot the source pgroup; lifetime follows the pgroup's retention policy on the array
-    arr.run(f"purepgroup snap --apply-retention --suffix {suffix} {q(src_pg)}")
+def snap_source(arr, src_pg, suffix):
+    """Step 1: snapshot the source pgroup; lifetime follows the pgroup's retention policy on the array.
+    Returns the snapshot name <pgroup>.<suffix>. Raises CLIError if the snapshot fails."""
+    arr.run(f"purepgroup snap --apply-retention --suffix {suffix} {shlex.quote(src_pg)}")
     src_snap = f"{src_pg}.{suffix}"
     log.info(f"Created snapshot {src_snap}")
+    return src_snap
 
-    # 2. Verify every source volume is in the snapshot before overwriting anything
-    out = arr.run(f"purevol list --snap --pgrouplist {q(src_snap)}")
+
+def verify_snapshot(arr, src_snap, vols, dry_run):
+    """Step 2: every source volume must be in the snapshot before anything is overwritten.
+    Raises CLIError if the snapshot doesn't exist (any more) or a volume is missing from it."""
+    try:
+        out = arr.run(f"purevol list --snap --pgrouplist {shlex.quote(src_snap)}")
+    except CLIError as e:
+        if _missing(e):
+            raise CLIError(f"snapshot {src_snap} doesn't exist on {arr.name} (removed by retention, or "
+                           f"destroyed?) - nothing overwritten. Run --snaponly again ({e})")
+        raise
     if not dry_run:
         present = snap_names(out)
         missing = [v["source"] for v in vols if f"{src_snap}.{v['source']}" not in present]
         if missing:
             raise CLIError(f"{src_snap} does not contain: {', '.join(missing)} - nothing overwritten")
+
+
+def start_pgroup(arr, pg, target, suffix, run_time, dry_run):
+    """Phase 1 for one pgroup (normal run): check DR volumes, snapshot, verify, overwrite, snapshot +
+    start replication. Returns a 'job' dict that monitor_all() polls; does NOT wait for the transfer.
+    Raises CLIError if any step fails; steps after the failure are not run for this pgroup."""
+    src_pg, dr_pg, vols = pg["source_pgroup"], pg["dr_pgroup"], pg["volumes"]
+    log.info(f"=== {src_pg} -> {dr_pg} -> {target}  (suffix {suffix}) ===")
+    sizes = check_dr_volumes(arr, vols)                       # 0
+    src_snap = snap_source(arr, src_pg, suffix)               # 1
+    verify_snapshot(arr, src_snap, vols, dry_run)             # 2
+    return overwrite_and_replicate(arr, pg, target, suffix, run_time, src_snap, sizes)   # 3 + 4
+
+
+def clone_pgroup(arr, pg, target, suffix, run_time, dry_run, on_change=None):
+    """Phase 1 for one pgroup with --cloneandreplicate: like start_pgroup, but uses the snapshot
+    <source pgroup>.<suffix> taken earlier by --snaponly instead of taking a new one.
+    on_change() is called just before the first DR volume is overwritten (the point after which the
+    pgroup can't simply be retried with the same snapshot)."""
+    src_pg, dr_pg, vols = pg["source_pgroup"], pg["dr_pgroup"], pg["volumes"]
+    src_snap = f"{src_pg}.{suffix}"
+    log.info(f"=== {src_snap} (from --snaponly) -> {dr_pg} -> {target} ===")
+    sizes = check_dr_volumes(arr, vols)                       # 0
+    verify_snapshot(arr, src_snap, vols, dry_run)             # 2 (also: does it still exist?)
+    if on_change:
+        on_change()
+    return overwrite_and_replicate(arr, pg, target, suffix, run_time, src_snap, sizes)   # 3 + 4
+
+
+def overwrite_and_replicate(arr, pg, target, suffix, run_time, src_snap, sizes):
+    """Steps 3 and 4: overwrite each DR volume from its volume in src_snap, then snapshot the DR pgroup
+    and start replication. Returns the 'job' dict monitor_all() polls."""
+    dr_pg, vols = pg["dr_pgroup"], pg["volumes"]
+    src_pg = pg["source_pgroup"]
+    q = shlex.quote
 
     # 3. Overwrite each existing DR volume from its source volume snapshot
     for v in vols:
@@ -1152,24 +1270,204 @@ def setup(arr, cfg, tarr=None):
     return len(failed)
 
 
+def now_iso():
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def snap_only(arr, cfg, config_path, target, suffix, run_time, state_path, dry_run):
+    """--snaponly: step 1 for every pgroup, back to back, and nothing else (no target login, no DR
+    volume checks), so it returns as fast as possible. Records the snapshots in the state file for
+    --cloneandreplicate. Returns the exit code: 0 all snapshots taken, 1 any failed (or the state file
+    couldn't be written)."""
+    pgs = cfg["protection_groups"]
+    try:
+        prev = read_state(state_path)
+    except ValueError as e:
+        log.warning(f"{e}; it will be replaced")
+        prev = None
+    if prev and unused_snapshots(prev):
+        log.warning(f"Replacing the --snaponly record of {prev.get('created')}: "
+                    f"{', '.join(e['snapshot'] for e in unused_snapshots(prev))} never went through "
+                    f"--cloneandreplicate. Those snapshots stay on the array until their retention expires")
+    log.info(f"=== --snaponly: snapshotting {len(pgs)} protection group(s), suffix {suffix} ===")
+    t0 = time.monotonic()
+    entries, failed = [], []
+    for pg in pgs:
+        src_pg = pg["source_pgroup"]
+        e = {"source_pgroup": src_pg, "dr_pgroup": pg["dr_pgroup"], "snapshot": f"{src_pg}.{suffix}",
+             "status": "ok", "error": None, "taken": None, "cloned": None}
+        try:
+            snap_source(arr, src_pg, suffix)
+            e["taken"] = now_iso()
+        except CLIError as ex:
+            e["status"], e["error"] = "failed", str(ex)
+            log.error(f"FAILED snapshot of {src_pg}: {ex}")
+            failed.append(src_pg)
+            if not dry_run:                       # DRDATA: the run failed for this pgroup
+                emit_failed_start(pg, suffix, run_time, target, str(ex))
+        entries.append(e)
+    secs = time.monotonic() - t0
+    ok = len(pgs) - len(failed)
+
+    st = {"_note": "Written by pg_dr_refresh.py --snaponly and read by --cloneandreplicate. Don't edit.",
+          "created": run_time, "suffix": suffix, "run_time": run_time,
+          "source_host": cfg["source_array"]["host"], "config": str(Path(config_path).resolve()),
+          "status": "pending" if ok else "failed", "snapshots": entries}
+    if dry_run:
+        log.info(f"Dry run: would record {ok} snapshot(s) in {state_path}")
+    else:
+        try:
+            write_state(state_path, st)
+            log.info(f"Recorded {ok} snapshot(s) for --cloneandreplicate in {state_path}")
+        except OSError as ex:
+            log.error(f"The snapshots were taken but could NOT be recorded in {state_path} ({ex}), so "
+                      f"--cloneandreplicate can't use them. Fix the folder permissions or set state_file "
+                      f"in the config, then run --snaponly again")
+            return 1
+
+    log.info(f"Snapshots finished in {secs:.1f}s: {ok} of {len(pgs)} taken"
+             + (f"; FAILED: {', '.join(failed)}" if failed else ""))
+    if ok:
+        log.info(f"The databases of the snapshotted protection groups can leave backup mode now. "
+                 f"Next: pg_dr_refresh.py -c {config_path} --cloneandreplicate")
+    if failed:
+        log.error(f"No usable snapshot of {', '.join(failed)}: run --snaponly again for a new one "
+                  f"(it snapshots every protection group again)")
+    log.info(f"##### pg_dr_refresh end (--snaponly)  {ok} snapshot(s) taken, {len(failed)} failed")
+    return 1 if failed else 0
+
+
+def load_pending_state(state_path, config_path, src_host, pgroups):
+    """--cloneandreplicate: the --snaponly state with at least one unused snapshot of a pgroup in the
+    config (pgroups = source pgroup names), or None after logging why there is nothing to do (the
+    caller then exits with code 2, nothing changed)."""
+    try:
+        st = read_state(state_path)
+    except ValueError as e:
+        log.error(f"--cloneandreplicate: {e}. Run --snaponly first. Nothing was changed")
+        return None
+    if st is None:
+        log.error(f"--cloneandreplicate uses the snapshots recorded by --snaponly, but there is no record "
+                  f"({state_path} doesn't exist). Run 'pg_dr_refresh.py -c {config_path} --snaponly' "
+                  f"first. Nothing was changed")
+        return None
+    if not unused_snapshots(st, pgroups):
+        used = [e["cloned"] for e in st["snapshots"] if e.get("cloned")]
+        why = (f"they were already used by --cloneandreplicate (at {max(used)})" if used
+               else "none of its snapshots succeeded")
+        log.error(f"--cloneandreplicate: nothing to do for the --snaponly run of {st.get('created')} "
+                  f"(suffix {st['suffix']}): {why}. Run --snaponly again first. Nothing was changed")
+        return None
+    if st.get("source_host") and st["source_host"].lower() != str(src_host).lower():
+        log.error(f"--cloneandreplicate: {state_path} was written for source array {st['source_host']}, "
+                  f"but this config's source_array.host is {src_host}. Run --snaponly with this config "
+                  f"first. Nothing was changed")
+        return None
+    created = None
+    try:
+        created = datetime.datetime.fromisoformat(st.get("created") or "")
+    except ValueError:
+        pass
+    age = f" ({fmt_duration((datetime.datetime.now() - created).total_seconds())} ago)" if created else ""
+    log.info(f"Using the --snaponly snapshots of {st.get('created')}{age}, suffix {st['suffix']}: "
+             f"{', '.join(e['snapshot'] for e in unused_snapshots(st, pgroups))}")
+    return st
+
+
+def clone_phase1(arr, cfg, st, state_path, target, suffix, run_time, dry_run, failed, jobs, skipped):
+    """--cloneandreplicate phase 1: for each pgroup in the config, overwrite its DR volumes from the
+    snapshot --snaponly recorded and start replication. Appends to failed / jobs / skipped.
+    A pgroup is marked used ("cloned") in the state file just before its first DR volume is
+    overwritten; one that fails before that point stays unused, so the next -C retries it."""
+    by_pg = {e["source_pgroup"]: e for e in st["snapshots"]}
+    in_cfg = {pg["source_pgroup"] for pg in cfg["protection_groups"]}
+
+    def save():
+        try:
+            st["status"] = "pending" if unused_snapshots(st, in_cfg) else "used"
+            write_state(state_path, st)
+        except OSError as ex:
+            log.warning(f"Could not update {state_path} ({ex}); a later --cloneandreplicate may "
+                        f"process these protection groups again")
+
+    for pg in cfg["protection_groups"]:
+        src_pg = pg["source_pgroup"]
+        e = by_pg.get(src_pg)
+        if e is None:
+            msg = (f"no snapshot of {src_pg} was recorded by --snaponly at {st.get('created')} "
+                   f"(added to the config since?) - run --snaponly again")
+            log.error(f"FAILED {src_pg} -> {pg['dr_pgroup']}: {msg}")
+            failed.append(src_pg)
+            if not dry_run:
+                emit_failed_start(pg, suffix, run_time, target, msg)
+            continue
+        if e.get("status") != "ok":
+            log.error(f"FAILED {src_pg} -> {pg['dr_pgroup']}: its --snaponly snapshot failed "
+                      f"({e.get('error')}) - run --snaponly again")
+            failed.append(src_pg)                  # DRDATA was already written by --snaponly
+            continue
+        if e.get("cloned"):
+            log.info(f"{e['snapshot']}: already used by --cloneandreplicate at {e['cloned']}, skipped")
+            skipped.append(src_pg)
+            continue
+        if e.get("dr_pgroup") and e["dr_pgroup"] != pg["dr_pgroup"]:
+            log.warning(f"{src_pg}: dr_pgroup was {e['dr_pgroup']} when --snaponly ran, now "
+                        f"{pg['dr_pgroup']}; using {pg['dr_pgroup']} from the config")
+
+        def mark(e=e):
+            e["cloned"] = now_iso()
+            save()
+
+        try:
+            job = clone_pgroup(arr, pg, target, suffix, run_time, dry_run, on_change=None if dry_run else mark)
+            if not dry_run:
+                jobs.append(job)
+        except CLIError as ex:
+            log.error(f"FAILED {src_pg} -> {pg['dr_pgroup']}: {ex}")
+            if not dry_run and not e.get("cloned"):
+                log.info(f"{e['snapshot']} wasn't used (nothing overwritten); the next "
+                         f"--cloneandreplicate retries it")
+            failed.append(src_pg)
+            if not dry_run:
+                emit_failed_start(pg, suffix, run_time, target, str(ex))
+
+    extra = sorted(set(by_pg) - in_cfg)
+    if extra:
+        log.warning(f"--snaponly also recorded {', '.join(extra)}, which is no longer in the config; ignored")
+    if not dry_run:
+        save()
+
+
 def main():
     """Parse arguments, load the config, then run phase 1 (start) and phase 2 (monitor) for every pgroup.
-    Returns the process exit code: 0 all succeeded, 1 any pgroup failed."""
+    With --snaponly only the source snapshots are taken (and recorded); with --cloneandreplicate the
+    recorded snapshots are used instead of new ones.
+    Returns the process exit code: 0 all succeeded, 1 any pgroup failed, 2 usage error."""
     ap = argparse.ArgumentParser(description="FlashArray pgroup DR refresh + replication")
     ap.add_argument("-c", "--config", required=True, help="JSON config file")
     ap.add_argument("-V", "--verbose", action="store_true",
                     help="show CLI commands/array output and a replication progress bar")
     ap.add_argument("--dry-run", action="store_true", help="log the commands without running them")
-    ap.add_argument("--setup", action="store_true",
-                    help="one-time: connect the arrays (reads the target's connection key over SSH), "
-                         "create every missing volume in the config (source and DR), then the "
-                         "source and DR pgroups, add the volumes to them, and add the replication target "
-                         "to the DR pgroups (retention is not changed). With --dry-run, reads the array "
-                         "and shows what would be created")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--setup", action="store_true",
+                      help="one-time: connect the arrays (reads the target's connection key over SSH), "
+                           "create every missing volume in the config (source and DR), then the "
+                           "source and DR pgroups, add the volumes to them, and add the replication target "
+                           "to the DR pgroups (retention is not changed). With --dry-run, reads the array "
+                           "and shows what would be created")
+    mode.add_argument("-S", "--snaponly", action="store_true",
+                      help="only snapshot the source pgroups, as fast as possible, and record the "
+                           "snapshots in the state file; the databases can leave backup mode afterwards. "
+                           "Follow with --cloneandreplicate")
+    mode.add_argument("-C", "--cloneandreplicate", action="store_true",
+                      help="overwrite the DR volumes from the snapshots recorded by the last --snaponly, "
+                           "then snapshot + replicate the DR pgroups and monitor them. Fails (exit 2, "
+                           "nothing changed) if --snaponly hasn't recorded unused snapshots")
     args = ap.parse_args()
 
     cfg, s = load_config(args.config)
     log_path = setup_logging(resolve_log_base(cfg, args.config), args.verbose, args.dry_run)
+    state_path = resolve_state_path(cfg, args.config)
     src = cfg["source_array"]
     arr = FlashArray(src["host"], src["host"], src.get("ssh_user") or "pureuser",
                      src.get("ssh_key") or None, s["ssh_timeout_seconds"], args.dry_run)
@@ -1179,8 +1477,10 @@ def main():
     suffix = f"{s['snapshot_prefix']}-{started:%Y%m%d-%H%M%S}"     # one suffix for every pgroup in this run
     run_time = started.isoformat(timespec="seconds")               # DRDATA 'time' = run start (report date)
 
+    mode_label = ("SETUP" if args.setup else "SNAPONLY" if args.snaponly
+                  else "CLONEANDREPLICATE" if args.cloneandreplicate else "")
     log.info(f"##### pg_dr_refresh start  config={args.config}  source={src['host']}  target={target}  "
-             f"{'DRY-RUN ' if args.dry_run else ''}{'SETUP' if args.setup else ''}")
+             f"{'DRY-RUN ' if args.dry_run else ''}{mode_label}")
     log.info(f"Log file: {log_path}")
     # The target array: replication is monitored there; --setup also reads its connection key there.
     # Login = target_array.ssh_user / ssh_key (each defaults to the source_array value if left out).
@@ -1188,6 +1488,20 @@ def main():
     tarr = FlashArray(thost, thost, tcfg.get("ssh_user") or src.get("ssh_user") or "pureuser",
                       tcfg.get("ssh_key", src.get("ssh_key")) or None, s["ssh_timeout_seconds"], args.dry_run)
     log.info(f"Source array: {src['host']} as {arr.user}.  Target array: {thost} as {tarr.user}")
+
+    # --snaponly: snapshots only, straight away - no name lookup, no target check or login
+    if args.snaponly:
+        return snap_only(arr, cfg, args.config, target, suffix, run_time, state_path, args.dry_run)
+
+    # --cloneandreplicate: use the --snaponly snapshots; stop before touching anything if there are none
+    st = None
+    if args.cloneandreplicate:
+        st = load_pending_state(state_path, args.config, src["host"],
+                                {pg["source_pgroup"] for pg in cfg["protection_groups"]})
+        if st is None:
+            return 2
+        suffix, run_time = st["suffix"], st.get("run_time") or st.get("created") or run_time
+
     monitor = s["wait_for_replication"] or args.verbose
     if not args.dry_run:
         try:
@@ -1210,17 +1524,20 @@ def main():
         return 1 if setup(arr, cfg, tarr) else 0
 
     # Phase 1: start every protection group (snapshot, overwrite, replicate-now) without waiting
-    failed, jobs = [], []
-    for pg in cfg["protection_groups"]:
-        try:
-            job = start_pgroup(arr, pg, target, suffix, run_time, args.dry_run)
-            if not args.dry_run:
-                jobs.append(job)
-        except CLIError as e:
-            log.error(f"FAILED {pg['source_pgroup']} -> {pg['dr_pgroup']}: {e}")
-            failed.append(pg["source_pgroup"])
-            if not args.dry_run:
-                emit_failed_start(pg, suffix, run_time, target, str(e))
+    failed, jobs, skipped = [], [], []
+    if st is not None:
+        clone_phase1(arr, cfg, st, state_path, target, suffix, run_time, args.dry_run, failed, jobs, skipped)
+    else:
+        for pg in cfg["protection_groups"]:
+            try:
+                job = start_pgroup(arr, pg, target, suffix, run_time, args.dry_run)
+                if not args.dry_run:
+                    jobs.append(job)
+            except CLIError as e:
+                log.error(f"FAILED {pg['source_pgroup']} -> {pg['dr_pgroup']}: {e}")
+                failed.append(pg["source_pgroup"])
+                if not args.dry_run:
+                    emit_failed_start(pg, suffix, run_time, target, str(e))
 
     # Phase 2: monitor all replications together ON THE TARGET and log data / time per pgroup and volume
     if args.dry_run and monitor:
@@ -1237,9 +1554,10 @@ def main():
         for j in jobs:
             emit_started(j)
 
-    ok = len(cfg["protection_groups"]) - len(failed)
+    ok = len(cfg["protection_groups"]) - len(failed) - len(skipped)
     log.info(f"##### pg_dr_refresh end  {ok} succeeded, {len(failed)} failed"
-             + (f" ({', '.join(failed)})" if failed else ""))
+             + (f" ({', '.join(failed)})" if failed else "")
+             + (f", {len(skipped)} already done earlier ({', '.join(skipped)})" if skipped else ""))
     return 1 if failed else 0
 
 
