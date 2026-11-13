@@ -1,8 +1,9 @@
 // ============================================================================
 //  pg_dr_refresh.py configuration
 //  JSON with // comments (the script strips comments before parsing).
-//  Retention is NOT set here: each snapshot follows the retention policy
-//  already configured on its protection group on the array.
+//  Each snapshot follows the retention policy of its protection group on the
+//  array. --setup sets that policy from the "retention" block below wherever
+//  it differs; normal runs never change it.
 // ============================================================================
 {
   // ---------------------------------------------------------------- arrays --
@@ -70,7 +71,7 @@
 
   // ----------------------------------------------------------- state file --
   // Optional. Where --snaponly (-S) records the snapshots it took, for the
-  // --cloneandreplicate (-C) run that follows. Written by the script - don't edit it.
+  // --cloneandreplicate (-R) run that follows. Written by the script - don't edit it.
   // A relative path is taken relative to the folder this config file is in.
   // If omitted, defaults to <config name>.state.json next to this file
   // (e.g. pg_dr_config.state.json). Not used by normal runs or --setup.
@@ -102,13 +103,47 @@
     "ssh_timeout_seconds": 600
   },
 
+  // ------------------------------------------------------------ retention --
+  // Retention that --setup applies to every protection group below. --setup reads
+  // each group's current retention (purepgroup list --retention) and, where it
+  // differs from these values, changes it with purepgroup retain. Normal runs,
+  // -S and -R never change retention.
+  //   * Run --setup --dry-run first: it lists every change it would make
+  //     (for example "days 14 -> 7") without changing anything.
+  //   * Leave a field out to leave that setting as it is on the array. Set a whole
+  //     section to null (or remove it) to leave that retention as it is.
+  //   * A protection group entry can override any of this with its own
+  //     "retention" block (see PG2 below); its values replace these field by field.
+  //
+  // Purity keeps every snapshot for all_for, then per_day snapshots per day for
+  // days more days. Example: all_for 1d, per_day 4, days 7 keeps every snapshot
+  // for a day, then 4 a day for the next 7 days (the Purity defaults).
+  //   all_for = a period: "30m", "12h", "1d", "2w" (or a whole number of seconds)
+  //   per_day = snapshots kept per day after all_for (whole number)
+  //   days    = days per_day snapshots are kept after all_for (whole number)
+  "retention": {
+    // source_pgroup snapshots, kept on the source array
+    // (purepgroup retain --all-for / --per-day / --days <source_pgroup>)
+    "source": { "all_for": "1d", "per_day": 4, "days": 7 },
+
+    // dr_pgroup snapshots, kept on the source array
+    // (purepgroup retain --all-for / --per-day / --days <dr_pgroup>)
+    "dr":     { "all_for": "1d", "per_day": 4, "days": 7 },
+
+    // dr_pgroup snapshots replicated to target_array, kept there. This is the
+    // space pure-dr-report.py's retention estimate is about.
+    // (purepgroup retain --target-all-for / --target-per-day / --target-days <dr_pgroup>)
+    "target": { "all_for": "1d", "per_day": 4, "days": 7 }
+  },
+
   // ---------------------------------------------------- protection groups --
   // Processed in order. For each entry: snapshot source_pgroup, overwrite every
   // "target" volume from its "source" volume in that snapshot, then snapshot
   // dr_pgroup and replicate it to target_array.
   // --setup builds everything listed here on the source array: first every missing
   // volume (source and target), then source_pgroup and dr_pgroup, adding the volumes
-  // to them, then target_array on dr_pgroup. Nothing that already exists is changed.
+  // to them, then target_array on dr_pgroup, then the retention above. Apart from
+  // retention, nothing that already exists is changed.
   "protection_groups": [
     {
       // Protection group on the source array to snapshot. --setup creates it if
@@ -134,6 +169,14 @@
     {
       "source_pgroup": "PG2",
       "dr_pgroup":     "PG2-DR",
+
+      // Optional: retention for this entry only. Replaces the global "retention"
+      // values field by field; fields not given here come from the global block.
+      // Here PG2-DR's snapshots are kept on the target for 30 days instead of 7.
+      "retention": {
+        "target": { "days": 30 }
+      },
+
       "volumes": [
         { "target": "sql-db-dr",  "source": "sql-db",  "size": "100G" },
         { "target": "sql-log-dr", "source": "sql-log", "size": "100G" }

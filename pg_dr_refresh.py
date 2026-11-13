@@ -22,8 +22,10 @@ For every protection group (pgroup) listed in the JSON config, in order:
        plus one machine-readable 'DRDATA {json}' log line per pgroup and per volume.
        pure-dr-report.py reads those DRDATA lines to build its reports.
 
-Snapshot lifetime follows the retention policy already set on each pgroup on the array
-(--apply-retention), so the script never deletes snapshots itself.
+Snapshot lifetime follows the retention policy set on each pgroup on the array (--apply-retention),
+so the script never deletes snapshots itself. --setup sets that policy from the config's "retention"
+blocks wherever it differs (source and DR pgroups on the source array, and the DR pgroups' target
+retention on the target array); retention that isn't in the config is left as is.
 
 Both arrays are reached over SSH. The SOURCE array takes the snapshots, overwrites the DR volumes and
 starts replication. The TARGET array (target_array.host, logged in as target_array.ssh_user) is where the
@@ -51,7 +53,7 @@ Configuration
 -------------
 JSON with optional // and /* */ comments - see pg_dr_config.json for every setting.
 
-Split runs: --snaponly (-S) then --cloneandreplicate (-C)
+Split runs: --snaponly (-S) then --cloneandreplicate (-R)
 --------------------------------------------------------
 A normal run does steps 0-6 in one go. To keep the time a database spends in backup mode as short as
 possible, the work can be split in two:
@@ -60,17 +62,17 @@ possible, the work can be split in two:
                             Nothing else is checked or contacted (not the target array, not the DR
                             volumes), so the database can leave backup mode as soon as this returns.
                             The snapshots taken are recorded in a small state file (see below).
-  -C / --cloneandreplicate  Steps 0 and 2-6, using the snapshots recorded by the last --snaponly run:
+  -R / --cloneandreplicate  Steps 0 and 2-6, using the snapshots recorded by the last --snaponly run:
                             check the DR volumes, check each recorded snapshot still exists and holds
                             every source volume, overwrite the DR volumes, snapshot + replicate the
                             DR pgroups and monitor them on the target.
 
--C fails (exit code 2, nothing changed) if --snaponly hasn't recorded any snapshots, or if they have
-all been used by an earlier -C already: run -S again first. If a pgroup fails in -C before any of its
+-R fails (exit code 2, nothing changed) if --snaponly hasn't recorded any snapshots, or if they have
+all been used by an earlier -R already: run -S again first. If a pgroup fails in -R before any of its
 DR volumes were overwritten (e.g. a DR volume is missing), it stays unused in the state file and the
-next -C retries just that pgroup with the same snapshot.
+next -R retries just that pgroup with the same snapshot.
 
-The DR snapshots made by -C use the same suffix as the -S snapshots (e.g. PG1.dr-20261109-020000 and
+The DR snapshots made by -R use the same suffix as the -S snapshots (e.g. PG1.dr-20261109-020000 and
 PG1-DR.dr-20261109-020000), so names still show the point in time the data is from.
 
 State file: "state_file" in the config, or by default <config name>.state.json next to the config
@@ -85,10 +87,10 @@ Usage
   pg_dr_refresh.py -c pg_dr_config.json --setup    # one-time: connect the arrays, create the volumes,
                                                    # then the pgroups + target
   pg_dr_refresh.py -c pg_dr_config.json -S         # snapshots only (database in backup mode)
-  pg_dr_refresh.py -c pg_dr_config.json -C         # then: overwrite + replicate from those snapshots
+  pg_dr_refresh.py -c pg_dr_config.json -R         # then: overwrite + replicate from those snapshots
 
 Exit code: 0 = every pgroup succeeded, 1 = at least one pgroup failed, 2 = config / usage error
-(including -C with no unused --snaponly snapshots).
+(including -R with no unused --snaponly snapshots).
 
 Requirements: Python 3.8+ and an OpenSSH client ('ssh' on the PATH) with key-based login to the
 source array. No extra Python packages are needed.
@@ -288,7 +290,7 @@ def write_state(path, st):
 
 
 def unused_snapshots(st, pgroups=None):
-    """State entries -C still has to process: snapshot taken OK and not yet used by a -C run.
+    """State entries -R still has to process: snapshot taken OK and not yet used by a -R run.
     pgroups = source pgroup names still in the config (entries for others are ignored)."""
     return [e for e in st["snapshots"] if e.get("status") == "ok" and not e.get("cloned")
             and (pgroups is None or e.get("source_pgroup") in pgroups)]
@@ -330,7 +332,9 @@ def load_config(path):
         errs.append("target_array.replication_transport must be \"ip\" or \"fc\"")
     for k in ("source_retention", "dr_retention"):
         if any(k in pg for pg in cfg.get("protection_groups") or []):
-            errs.append(f"'{k}' is no longer supported - set retention on the array (purepgroup retain)")
+            errs.append(f"'{k}' is no longer supported - use a \"retention\" block instead "
+                        f"(see pg_dr_config.json)")
+    validate_retention(cfg.get("retention"), "retention", errs)
     if "state_file" in cfg and not (cfg["state_file"] is None or isinstance(cfg["state_file"], str)):
         errs.append("state_file must be a file path (text) or null")
     if not PREFIX_RE.match(str(settings["snapshot_prefix"])):
@@ -344,6 +348,7 @@ def load_config(path):
         for k in ("source_pgroup", "dr_pgroup"):
             if not NAME_RE.match(str(pg.get(k, ""))):
                 errs.append(f"{tag}.{k} missing or invalid")
+        validate_retention(pg.get("retention"), f"{tag}.retention", errs)
         vols = pg.get("volumes") or []
         if not vols:
             errs.append(f"{tag}.volumes must list at least one {{target, source}} pair")
@@ -1089,6 +1094,197 @@ def _msg(e):
     return str(e).rstrip(". ")
 
 
+# ----------------------------------------------------------------------------- retention (--setup)
+# Config kinds -> (which pgroup of the entry, which retention of that pgroup)
+RET_KINDS = {"source": ("source_pgroup", "local"),    # source pgroup snapshots, on the source array
+             "dr":     ("dr_pgroup", "local"),        # DR pgroup snapshots, on the source array
+             "target": ("dr_pgroup", "target")}       # replicated DR pgroup snapshots, on the target array
+RET_FIELDS = ("all_for", "per_day", "days")
+RET_FLAGS = {"local":  {"all_for": "--all-for", "per_day": "--per-day", "days": "--days"},
+             "target": {"all_for": "--target-all-for", "per_day": "--target-per-day", "days": "--target-days"}}
+DUR_CFG_RE = re.compile(r"^\s*(\d+)\s*([smhdw]?)\s*$", re.I)
+DUR_TOKEN_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(weeks?|w|days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)?",
+                          re.I)
+DUR_SECONDS = {"w": 604800, "d": 86400, "h": 3600, "m": 60, "s": 1, "": 1}
+
+
+def parse_duration(v, strict=False):
+    """Retention period -> seconds, or None if empty, '-' or not understood.
+    Config values (strict): "1d", "12h", "30m", "2w", "90s" or a whole number of seconds.
+    Array output is read more loosely: "1d", "1d 12h", "36 hours", "86400"."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return int(v) if v >= 0 and float(v).is_integer() else None
+    s = str(v or "").strip()
+    if not s or s == "-":
+        return None
+    if strict:
+        m = DUR_CFG_RE.match(s)
+        return int(m.group(1)) * DUR_SECONDS[m.group(2).lower()] if m else None
+    total, pos = 0.0, 0
+    for m in DUR_TOKEN_RE.finditer(s):
+        if s[pos:m.start()].strip(" ,"):
+            return None                                   # something that isn't a duration
+        unit = (m.group(2) or "").lower()
+        total += float(m.group(1)) * DUR_SECONDS[unit[:1] if unit else ""]
+        pos = m.end()
+    return int(total) if pos and not s[pos:].strip(" ,") else None
+
+
+def parse_count(v):
+    """Per Day / Days column -> int, or None if '-', empty or not a number."""
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def duration_arg(seconds):
+    """Seconds -> the shortest exact Purity duration: 86400 -> '1d', 129600 -> '36h', 90 -> '90s'."""
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds and seconds % n == 0:
+            return f"{seconds // n}{unit}"
+    return f"{seconds}s"
+
+
+def fmt_retention(r):
+    """{'all_for': 86400, 'per_day': 4, 'days': 7} -> 'all for 1d, then 4 per day for 7 days'
+    (only the fields present)."""
+    if not r:
+        return "not reported"
+    parts = []
+    if r.get("all_for") is not None:
+        parts.append(f"all for {duration_arg(r['all_for'])}")
+    if r.get("per_day") is not None or r.get("days") is not None:
+        pd = r.get("per_day")
+        d = r.get("days")
+        parts.append(f"then {pd if pd is not None else '?'} per day for {d if d is not None else '?'} days")
+    return ", ".join(parts) or "not reported"
+
+
+def validate_retention(block, tag, errs):
+    """Check one "retention" block (global or per protection group); append problems to errs."""
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        errs.append(f"{tag} must be an object like {{\"target\": {{\"days\": 30}}}}")
+        return
+    for kind in sorted(set(block) - set(RET_KINDS)):
+        errs.append(f"{tag}.{kind} is not known - use source, dr or target")
+    for kind in RET_KINDS:
+        r = block.get(kind)
+        if r is None:
+            continue
+        if not isinstance(r, dict):
+            errs.append(f"{tag}.{kind} must be an object with all_for, per_day and/or days (or null)")
+            continue
+        for k in sorted(set(r) - set(RET_FIELDS)):
+            errs.append(f"{tag}.{kind}.{k} is not known - use all_for, per_day or days")
+        if "all_for" in r and parse_duration(r["all_for"], strict=True) is None:
+            errs.append(f"{tag}.{kind}.all_for must be a period like \"1d\", \"12h\", \"30m\" or \"2w\" "
+                        f"(or a whole number of seconds); got {r['all_for']!r}")
+        for k in ("per_day", "days"):
+            if k in r and (isinstance(r[k], bool) or not isinstance(r[k], int) or r[k] < 0):
+                errs.append(f"{tag}.{kind}.{k} must be a whole number >= 0 (got {r[k]!r})")
+
+
+def wanted_retention(cfg, pg):
+    """The retention the config asks for, per kind (source / dr / target), with the entry's own
+    "retention" overriding the global one field by field. A kind set to null (in the entry, or
+    globally without an entry value) isn't managed. Values are normalized (all_for in seconds)."""
+    glob, own = cfg.get("retention") or {}, pg.get("retention") or {}
+    out = {}
+    for kind in RET_KINDS:
+        if kind in own and own[kind] is None:
+            continue
+        r = {**(glob.get(kind) or {}), **(own.get(kind) or {})}
+        if r:
+            out[kind] = {k: (parse_duration(r[k], strict=True) if k == "all_for" else r[k])
+                         for k in RET_FIELDS if k in r}
+    return out
+
+
+def _table_rows(out):
+    """Rows of `purepgroup list --retention` output as lists of cells, header first.
+    Reads --csv output, or the text table (columns found from the header's positions)."""
+    lines = [l for l in out.splitlines() if l.strip()]
+    if not lines:
+        return []
+    if "," in lines[0]:
+        return [[c.strip() for c in r] for r in csv.reader(io.StringIO("\n".join(lines)))]
+    starts = [m.start() for m in re.finditer(r"\S+(?: \S+)*", lines[0])]
+    cut = lambda l: [l[a:b].strip() for a, b in zip(starts, starts[1:] + [None])]
+    return [cut(l) for l in lines]
+
+
+def read_retention(arr, pgroup):
+    """A pgroup's current retention: {"local": {...} or None, "target": {...} or None, "target_array": name}.
+    From `purepgroup list --retention --csv <pgroup>` (the text output if --csv isn't accepted).
+    The row for the source array (its Purity name; the first row if the name isn't known) is the local
+    retention; the first other row is the target retention. Read-only, so it also runs in --dry-run.
+    Raises CLIError if the retention can't be read."""
+    q = shlex.quote(pgroup)
+    try:
+        out = arr.run(f"purepgroup list --retention --csv {q}", read_only=True)
+    except CLIError as e:
+        if _missing(e):
+            raise
+        out = arr.run(f"purepgroup list --retention {q}", read_only=True)
+    rows = _table_rows(out)
+    if not rows:
+        raise CLIError(f"[{arr.name}] no retention listed for {pgroup}")
+    hdr = [h.lower() for h in rows[0]]
+    col = lambda *names: next((hdr.index(n) for n in names if n in hdr), None)
+    ni, ai = col("name"), col("array")
+    fi, pi, di = col("all for", "all_for"), col("per day", "per_day"), col("days")
+    if fi is None and pi is None and di is None:
+        raise CLIError(f"[{arr.name}] unexpected retention listing for {pgroup}: {rows[0]}")
+    g = lambda r, i: r[i] if i is not None and i < len(r) else ""
+    found, name = [], ""
+    for r in rows[1:]:
+        name = g(r, ni) or name                       # text output leaves Name blank on later rows
+        if ni is not None and name and name != pgroup:
+            continue
+        found.append({"array": g(r, ai), "all_for": parse_duration(g(r, fi)),
+                      "per_day": parse_count(g(r, pi)), "days": parse_count(g(r, di))})
+    if not found:
+        raise CLIError(f"[{arr.name}] no retention listed for {pgroup}")
+    me = (arr.purity_name or "").lower()
+    local = next((r for r in found if me and r["array"].lower() == me), found[0])
+    target = next((r for r in found if r is not local), None)
+    strip = lambda r: {k: r[k] for k in RET_FIELDS} if r else None
+    return {"local": strip(local), "target": strip(target), "target_array": target["array"] if target else None}
+
+
+def set_retention(arr, pg, pgroup, kind, scope, want, have, problem, did, new_in_dry_run, target_name):
+    """--setup step 4 for one kind of retention (source / dr / target) of one pgroup: compare the
+    config (want) with the array (have, None if unknown) and run purepgroup retain if they differ.
+    Returns True if it changed (or, in --dry-run, would change) the retention."""
+    where = {"source": f"{pgroup} on {arr.name}", "dr": f"{pgroup} on {arr.name}",
+             "target": f"{pgroup} on the target {target_name}"}[kind]
+    diffs = [k for k in RET_FIELDS if k in want and (have is None or have.get(k) != want[k])]
+    if not diffs:
+        log.info(f"Retention of {where} matches the config ({fmt_retention(want)}), left as is")
+        return False
+    show = lambda k, v: "?" if v is None else duration_arg(v) if k == "all_for" else str(v)
+    change = ", ".join(f"{k.replace('_', ' ')} {show(k, (have or {}).get(k))} -> {show(k, want[k])}"
+                       for k in diffs)
+    flags = RET_FLAGS[scope]
+    cmd = ("purepgroup retain " + " ".join(f"{flags[k]} {duration_arg(want[k]) if k == 'all_for' else want[k]}"
+                                           for k in RET_FIELDS if k in want) + f" {shlex.quote(pgroup)}")
+    try:
+        arr.run(cmd)
+    except CLIError as e:
+        problem(pg, f"can't set the retention of {where} ({fmt_retention(want)}): {_msg(e)}")
+        return False
+    if new_in_dry_run:
+        log.info(f"Would set the retention of {where} (new protection group) to {fmt_retention(want)}")
+    else:
+        log.info(f"{did('Changed', 'Would change')} the retention of {where}: {change}")
+    return True
+
+
 def setup(arr, cfg, tarr=None):
     """One-time build of everything in the config, in this order:
       1. Array connection - makes sure 'purearray connection list --csv' shows the target as "connected",
@@ -1105,8 +1301,13 @@ def setup(arr, cfg, tarr=None):
          pgroup, only the volumes not already in it are added. Nothing is ever removed.
          The replication target is then added to each DR pgroup (purepgroup setattr --addtargetlist);
          skipped, and reported, if step 1 couldn't connect the arrays.
-      4. Retention - shown for review, never changed.
-    Safe to run again: anything that already exists is reported and left unchanged.
+      4. Retention - for each pgroup, the retention the config's "retention" blocks ask for is compared
+         with `purepgroup list --retention` and, where it differs, set with purepgroup retain:
+           source -> source pgroup snapshots on the source array  (--all-for / --per-day / --days)
+           dr     -> DR pgroup snapshots on the source array      (--all-for / --per-day / --days)
+           target -> DR pgroup snapshots on the target array      (--target-all-for / -per-day / -days)
+         Retention that isn't in the config is shown and left as is.
+    Safe to run again: anything that already exists (or already matches) is reported and left unchanged.
     With --dry-run the array is read (list commands only) so the preview shows exactly what would be
     created; nothing is changed.
     Returns the number of protection_groups entries that are not fully set up (all of them if the
@@ -1245,26 +1446,41 @@ def setup(arr, cfg, tarr=None):
                         problem(pg, f"can't add target {target} to {pgroup}: {_msg(e)}. Check that "
                                     f"'purearray connection list' shows {target} (target_array.name)")
 
-    # ---- 4. retention (read only; groups that would only be created by a dry run don't exist yet)
-    log.info("=== setup step 4 of 4: retention (not changed) ===")
+    # ---- 4. retention: set what the config's "retention" blocks ask for; show the rest
+    log.info("=== setup step 4 of 4: retention ===")
+    n_ret = 0
     for pg in pgs:
-        show = [n for n in (pg["source_pgroup"], pg["dr_pgroup"])
-                if n in pgs_now and (not arr.dry_run or n in pgs_before)]
-        if not show:
-            continue
-        try:
-            out = arr.run(f"purepgroup list --retention {' '.join(q(n) for n in show)}", read_only=True)
-            if out:
-                log.info("Retention:\n" + "\n".join("    " + l for l in out.splitlines()))
-                log.info(f"To change it, e.g.: purepgroup retain --target-all-for 14d {pg['dr_pgroup']}")
-        except CLIError as e:
-            log.warning(f"Could not read retention ({e})")
+        want = wanted_retention(cfg, pg)
+        for pgroup in dict.fromkeys((pg["source_pgroup"], pg["dr_pgroup"])):
+            if pgroup not in pgs_now:
+                continue                              # couldn't be created; already reported
+            todo = [(kind, scope) for kind, (key, scope) in RET_KINDS.items()
+                    if pg[key] == pgroup and kind in want]
+            have, new_in_dry_run = None, arr.dry_run and pgroup not in pgs_before
+            if not new_in_dry_run:
+                try:
+                    have = read_retention(arr, pgroup)
+                except CLIError as e:
+                    log.warning(f"Could not read the retention of {pgroup} ({_msg(e)})"
+                                + ("; setting it from the config anyway" if todo else ""))
+            if not todo:
+                if have:
+                    log.info(f"Retention of {pgroup} (not in the config, left as is): "
+                             f"on {arr.name}: {fmt_retention(have['local'])}"
+                             + (f"; on {have['target_array']}: {fmt_retention(have['target'])}"
+                                if have["target"] else ""))
+                continue
+            for kind, scope in todo:
+                if set_retention(arr, pg, pgroup, kind, scope, want[kind],
+                                 (have or {}).get(scope), problem, did, new_in_dry_run,
+                                 (have or {}).get("target_array") or target):
+                    n_ret += 1
 
     failed = [k for k, v in problems.items() if v]
     nxt = ("run --setup again without --dry-run to make these changes" if arr.dry_run else
            "everything in the config is ready. Next: run with --dry-run, then -V")
     log.info(f"Setup finished: {did('created', 'would create')} {n_vols} volume(s) and {n_pgs} "
-             f"protection group(s); "
+             f"protection group(s), {did('changed', 'would change')} {n_ret} retention setting(s); "
              + (f"{len(failed)} not ready ({'; '.join(failed)}). Fix the errors above and run --setup again"
                 if failed else nxt))
     return len(failed)
@@ -1378,12 +1594,20 @@ def clone_phase1(arr, cfg, st, state_path, target, suffix, run_time, dry_run, fa
     """--cloneandreplicate phase 1: for each pgroup in the config, overwrite its DR volumes from the
     snapshot --snaponly recorded and start replication. Appends to failed / jobs / skipped.
     A pgroup is marked used ("cloned") in the state file just before its first DR volume is
-    overwritten; one that fails before that point stays unused, so the next -C retries it."""
+    overwritten; one that fails before that point stays unused, so the next -R retries it."""
     by_pg = {e["source_pgroup"]: e for e in st["snapshots"]}
     in_cfg = {pg["source_pgroup"] for pg in cfg["protection_groups"]}
 
     def save():
         try:
+            try:
+                now_on_disk = read_state(state_path)
+            except ValueError:
+                now_on_disk = None
+            if now_on_disk and now_on_disk.get("suffix") != st["suffix"]:
+                log.warning(f"{state_path} now holds a newer --snaponly run ({now_on_disk['suffix']}); "
+                            f"left as is, not updated for {st['suffix']}")
+                return
             st["status"] = "pending" if unused_snapshots(st, in_cfg) else "used"
             write_state(state_path, st)
         except OSError as ex:
@@ -1453,13 +1677,14 @@ def main():
                       help="one-time: connect the arrays (reads the target's connection key over SSH), "
                            "create every missing volume in the config (source and DR), then the "
                            "source and DR pgroups, add the volumes to them, and add the replication target "
-                           "to the DR pgroups (retention is not changed). With --dry-run, reads the array "
-                           "and shows what would be created")
+                           "to the DR pgroups, and set the retention from the config's \"retention\" "
+                           "blocks where it differs. With --dry-run, reads the array and shows what "
+                           "would be created or changed")
     mode.add_argument("-S", "--snaponly", action="store_true",
                       help="only snapshot the source pgroups, as fast as possible, and record the "
                            "snapshots in the state file; the databases can leave backup mode afterwards. "
                            "Follow with --cloneandreplicate")
-    mode.add_argument("-C", "--cloneandreplicate", action="store_true",
+    mode.add_argument("-R", "--cloneandreplicate", action="store_true",
                       help="overwrite the DR volumes from the snapshots recorded by the last --snaponly, "
                            "then snapshot + replicate the DR pgroups and monitor them. Fails (exit 2, "
                            "nothing changed) if --snaponly hasn't recorded unused snapshots")
